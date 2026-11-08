@@ -7,7 +7,7 @@ picture to Claude (vision, Messages API), renders Claude's text reply into Picto
 room through the host's GUI port, like pictochat_gui.py does. It can run next to the GUI.
 
 Setup (once):
-    python3 -m venv --system-site-packages .venv && .venv/bin/pip install anthropic
+    python3 -m venv .venv && .venv/bin/pip install anthropic pillow
     export ANTHROPIC_API_KEY=...                  # or an `ant auth login` profile
 
 Run:
