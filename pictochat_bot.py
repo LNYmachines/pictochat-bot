@@ -52,6 +52,10 @@ asks for something longer. Write plain text only: no markdown, no emoji, no list
 If a picture is a drawing without words, react to what it shows. If you cannot read the writing, say what you can
 make out and ask. Earlier pictures in the conversation are earlier messages of the same room.
 
+Messages are labelled with the sender's DS nickname when it is known; use names naturally. A text starting with
+"[Room event]" is a notice from the room (you entered, someone joined), not a message from a person: answer it with
+one short, warm greeting that uses the names given.
+
 You can also draw: the draw_picture tool sends a picture of your own into the room. Use it when someone asks you to
 draw something, or when a quick sketch says it better than words. Keep drawings simple and bold (outlines, big
 shapes, a few colours) - the canvas is tiny. You can add a short text message before or after a drawing."""
@@ -451,6 +455,77 @@ class ClaudeChat:
         return "ok, %d drawing(s), %d image(s), %d in / %d out tokens" % (len(drawn), len(sent_images), usage_in,
                                                                            usage_out)
 
+    def greet(self, event, send_text):
+        """Say hello for a room event (a plain-text note such as 'You just entered the room. In the room: Ann, Bo.').
+        No tools: one short text reply, kept in the history so later replies know who is here."""
+        user = {"role": "user", "content": "[Room event] " + event}
+        kwargs = dict(model=self.model, max_tokens=2048, system=SYSTEM, messages=self.messages + [user],
+                      output_config={"effort": self.effort})
+        if self.fallbacks:
+            kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
+        try:
+            message = self.client.beta.messages.create(**kwargs)
+        except self.anthropic.APIStatusError as e:
+            return "API error %s: %s" % (e.status_code, e.message)
+        except self.anthropic.APIConnectionError as e:
+            return "no connection to the API: %s" % type(e).__name__
+        if message.stop_reason == "refusal":
+            return "refused"
+        text = "".join(b.text for b in message.content if b.type == "text").strip()
+        if not text:
+            return "empty greeting (stop_reason %s)" % message.stop_reason
+        send_text(text)
+        self.messages += [user, {"role": "assistant", "content": text}]
+        if len(self.messages) > 2 * self.keep:
+            self.messages = self.messages[-2 * self.keep:]
+        return "ok, %d in / %d out tokens" % (message.usage.input_tokens, message.usage.output_tokens)
+
+
+def member_info(msg):
+    """(mac string, nickname, kind) of a `03 00` (joining) / `03 01` (ready) member message, else None."""
+    if len(msg) < 28 or msg[0] != 3 or msg[1] not in (0, 1):
+        return None
+    name = msg[8:28].decode("utf-16-le", "replace").split("\x00")[0].strip()
+    return sender_of(msg), name, "joining" if msg[1] == 0 else "ready"
+
+
+def name_list(names):
+    names = [n for n in names if n]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1] if names else ""
+
+
+class Room:
+    """Who is in the room, from the host's GUI events: names from member messages, presence from `state` events
+    (MACs of associated DSes, every 5 s) and 'deauthenticated' log lines."""
+
+    def __init__(self):
+        self.names = {}          # mac -> nickname (also of DSes that left; the replay contains old joins)
+        self.present = None      # set of macs from the latest state event; None until the first one arrives
+        self.greeted = {}        # mac -> time of the last personal welcome
+
+    def on_member(self, msg):
+        info = member_info(msg)
+        if info:
+            self.names[info[0]] = info[1]
+        return info
+
+    def on_state(self, ev):
+        self.present = set((ev.get("aids") or {}).keys())
+
+    def on_log(self, text):
+        """Handles the host's '# station <mac> deauthenticated ...' line; returns the MAC of a DS that left, or None."""
+        import re
+        m = re.match(r"# station ([0-9a-f:]{17}) deauthenticated", text or "")
+        if not m:
+            return None
+        if self.present is not None:
+            self.present.discard(m.group(1))
+        return m.group(1)
+
+    def present_names(self):
+        macs = self.present if self.present is not None else set(self.names)
+        return [self.names.get(m, "") for m in sorted(macs)]
+
 
 DEMO_SHAPES = [  # used by --dry-run: a sun, a house and a caption
     {"kind": "ellipse", "points": [[8, 6], [36, 34]], "color": "yellow", "fill": True},
@@ -494,6 +569,7 @@ def main():
     ap.add_argument("--keep-name", action="store_true", help="do not rename the host")
     ap.add_argument("--dry-run", action="store_true", help="no API calls: reply with a fixed text")
     ap.add_argument("--no-web", action="store_true", help="no web search, web fetch or image downloads")
+    ap.add_argument("--no-greet", action="store_true", help="do not say hi on entering or welcome DSes that join")
     ap.add_argument("--send-image", metavar="URL", help="TEST: download, dither and post this image (or page's "
                                                         "main image) to the room, then exit; no API calls")
     ap.add_argument("--colour", action="store_true", help="with --send-image: 16-colour instead of black and white")
@@ -553,31 +629,67 @@ def main():
         log("reply: (drawing)")
         post(gui.clip(rows))
 
+    my_name = (a.bot_name or bot_name(a.model))[:10]
+
     def worker():
         while True:
-            msg = work.get()
+            job = work.get()
+            if job[0] == "greet":
+                _, event, names = job
+                if a.dry_run:
+                    send_text("Hi %s! I'm %s, happy to chat." % (name_list(names) or "everyone", my_name))
+                    info = "dry run"
+                else:
+                    info = chat.greet(event, send_text)
+                log("greeting (%s) -> %s" % (name_list(names) or "everyone", info))
+                continue
+            msg = job[1]
             who = sender_of(msg)
+            who_name = room.names.get(who)
+            label = "%s (%s)" % (who_name, who) if who_name else who
             if a.dry_run:
                 send_text("I got your picture (%d bytes). Bot is in dry-run mode; here is a test drawing." % len(msg))
                 send_picture(render_shapes(DEMO_SHAPES))
                 info = "dry run"
             else:
-                info = chat.ask(message_png(msg), who, send_text, send_picture)
-            log("message from %s -> %s" % (who, info))
+                info = chat.ask(message_png(msg), label, send_text, send_picture)
+            log("message from %s -> %s" % (label, info))
 
+    room = Room()
     threading.Thread(target=worker, daemon=True).start()
     while True:
         s = connect()
         sock_holder["s"] = s
         if not a.keep_name:
-            name = (a.bot_name or bot_name(a.model))[:10]
-            s.sendall((json.dumps({"cmd": "set_name", "name": name}) + "\n").encode())
-            log("room nickname: %s (DSes that join from now on see it; rejoin the room to see the new name)" % name)
-        ignore_until = 0 if a.answer_backlog else time.time() + 1.5     # the host replays its history on connect
+            s.sendall((json.dumps({"cmd": "set_name", "name": my_name}) + "\n").encode())
+            log("room nickname: %s (DSes that join from now on see it; rejoin the room to see the new name)" % my_name)
+        t_conn = time.time()
+        ignore_until = 0 if a.answer_backlog else t_conn + 1.5        # the host replays its history on connect
+        entry_done = a.no_greet
+        s.settimeout(0.5)
         buf = b""
         try:
             while True:
-                d = s.recv(65536)
+                now = time.time()
+                # say hi once the replay is through and the first state event told us who is here (max ~6.5 s)
+                if not entry_done and now >= ignore_until and (room.present is not None or now > t_conn + 6.5):
+                    entry_done = True
+                    names = room.present_names()
+                    if names:
+                        for m in (room.present or room.names):
+                            room.greeted[m] = now
+                        known = [n for n in names if n]
+                        event = ("You (%s) just entered the PictoChat room. In the room: %s%s. Say hi to everyone, "
+                                 "by name." % (my_name, name_list(known) or "people",
+                                               " and %d more" % (len(names) - len(known)) if known and
+                                               len(known) < len(names) else ""))
+                        work.put(("greet", event, names))
+                    else:
+                        log("room is empty; will welcome the first DS that joins")
+                try:
+                    d = s.recv(65536)
+                except socket.timeout:
+                    continue
                 if not d:
                     break
                 buf += d
@@ -587,14 +699,36 @@ def main():
                         ev = json.loads(line)
                     except ValueError:
                         continue
-                    if ev.get("kind") != "message" or ev.get("dir") != "rx" or not ev.get("hex"):
+                    kind = ev.get("kind")
+                    if kind == "state":
+                        room.on_state(ev)
+                        continue
+                    if kind == "log":
+                        gone = room.on_log(ev.get("text"))
+                        if gone:
+                            log("%s left the room" % (room.names.get(gone) or gone))
+                        continue
+                    if kind != "message" or ev.get("dir") != "rx" or not ev.get("hex"):
                         continue
                     msg = bytes.fromhex(ev["hex"])
+                    info = room.on_member(msg)
+                    if info:
+                        mac, name, mkind = info
+                        if room.present is not None:
+                            room.present.add(mac)
+                        # a DS that joins after the bot is in: welcome it by name (once per 2 minutes per DS)
+                        if (mkind == "ready" and time.time() >= ignore_until and not a.no_greet
+                                and time.time() - room.greeted.get(mac, 0) > 120):
+                            room.greeted[mac] = time.time()
+                            log("%s joined the room" % (name or mac))
+                            work.put(("greet", "%s just joined the PictoChat room. Welcome them by name."
+                                      % (name or "Someone (no nickname)"), [name]))
+                        continue
                     if msg[:2] != b"\x03\x02":
-                        continue                         # member messages (joining / ready), not chat
+                        continue
                     if time.time() < ignore_until:
                         continue
-                    work.put(msg)
+                    work.put(("chat", msg))
         except OSError:
             pass
         sock_holder.pop("s", None)
