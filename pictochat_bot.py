@@ -76,9 +76,11 @@ shapes, a few colours) - the canvas is tiny. You can add a short text message be
 
 A message that starts with a slash is a command for you as the bot: /debug (switch the small line with time and
 tokens after each reply on or off; "/debug on" or "/debug off" to set it), /model NAME (switch the model: haiku,
-sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /help (list the commands). Call
+sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /wallet (money spent), /help
+(list the commands). Call
 run_command with the command exactly as written, then confirm the result in a few words in a small style (e.g.
-"[mono small] Debug mode on."). For /host and /help, show what the command returned, compactly, in [mono small]. If you are
+"[mono small] Debug mode on."). For /host, /wallet and /help, show what the command returned, compactly, in
+[mono small]. If you are
 not sure a slash message is meant as a command, just chat.
 
 When someone asks for a QR code (or a link that is hard to copy by hand), use send_qr_code: it sends a real,
@@ -535,6 +537,109 @@ def host_status(state=None):
     return "; ".join(parts) or "no status available"
 
 
+# ---------------------------------------------------------------- spending (/wallet)
+# $ per million tokens: input, output, cache read; cache writes (5-minute TTL) cost 1.25x input. Web searches are
+# billed per use ($10 per 1000). Haiku 5.5 doubles above 100K-token prompts, which this bot never reaches.
+PRICES = {
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.20),
+    "claude-opus-5-5": (4.0, 20.0, 0.20),
+    "claude-fable-5-1": (10.0, 50.0, 0.25),
+}
+WEB_SEARCH_USD = 0.01
+WALLET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallet.json")
+
+
+def request_cost(model, usage):
+    """Estimated $ for one API response from its usage block (None for a model without a price here)."""
+    p = PRICES.get(model)
+    if not p or usage is None:
+        return None
+    cin, cout, cread = p
+    uncached = usage.input_tokens or 0
+    read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    stu = getattr(usage, "server_tool_use", None)
+    searches = (getattr(stu, "web_search_requests", 0) or 0) if stu else 0
+    return (uncached * cin + write * cin * 1.25 + read * cread + (usage.output_tokens or 0) * cout) / 1e6 \
+        + searches * WEB_SEARCH_USD
+
+
+class Wallet:
+    """Running total of what this bot spent (estimated from token usage), per day, kept in wallet.json."""
+
+    def __init__(self, path=WALLET_FILE):
+        self.path, self.lock, self.run, self.run_requests = path, threading.Lock(), 0.0, 0
+        try:
+            with open(path) as fh:
+                self.data = json.load(fh)
+        except (OSError, ValueError):
+            self.data = {}
+        self.data.setdefault("since", time.strftime("%Y-%m-%d"))
+        self.data.setdefault("days", {})
+
+    def add(self, usd):
+        if not usd:
+            return
+        with self.lock:
+            self.run += usd
+            self.run_requests += 1
+            day = time.strftime("%Y-%m-%d")
+            self.data["days"][day] = self.data["days"].get(day, 0.0) + usd
+            try:
+                tmp = self.path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(self.data, fh)
+                os.replace(tmp, self.path)
+            except OSError:
+                pass
+
+    def summary(self):
+        with self.lock:
+            days = self.data["days"]
+            today = days.get(time.strftime("%Y-%m-%d"), 0.0)
+            month = sum(v for k, v in days.items() if k.startswith(time.strftime("%Y-%m")))
+            return ("bot spent (estimated from tokens): $%.3f this run (%d requests), $%.3f today, $%.2f this month, "
+                    "$%.2f since %s" % (self.run, self.run_requests, today, month, sum(days.values()),
+                                        self.data["since"]))
+
+
+def org_costs():
+    """Actual costs of the whole organization from Anthropic's cost report (needs an Admin API key in
+    ANTHROPIC_ADMIN_KEY; ordinary keys cannot read it). Returns a text, or None without an admin key."""
+    key = os.environ.get("ANTHROPIC_ADMIN_KEY")
+    if not key:
+        return None
+    import datetime
+    import urllib.parse
+    import urllib.request
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    params = {"starting_at": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": 31}
+    today_c = month_c = 0.0
+    page = None
+    try:
+        for _ in range(5):
+            q = dict(params, **({"page": page} if page else {}))
+            req = urllib.request.Request("https://api.anthropic.com/v1/organizations/cost_report?" +
+                                         urllib.parse.urlencode(q),
+                                         headers={"x-api-key": key, "anthropic-version": "2026-10-21",
+                                                  "User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                d = json.load(r)
+            for b in d.get("data", []):
+                cents = sum(float(x.get("amount") or 0) for x in b.get("results", []))  # amounts are in cents
+                month_c += cents
+                if b.get("starting_at", "").startswith(now.strftime("%Y-%m-%d")):
+                    today_c += cents
+            if not d.get("has_more"):
+                break
+            page = d.get("next_page")
+    except (OSError, ValueError) as e:
+        return "Anthropic cost report failed: %s" % e
+    return "Anthropic says (whole organization): $%.2f today, $%.2f this month" % (today_c / 100, month_c / 100)
+
+
 CONTROL_SOCKET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.sock")
 QR_QUIET = 2   # modules of blank paper around the code (the standard asks for 4; the bubble adds more on the sides)
 
@@ -599,6 +704,7 @@ class ClaudeChat:
         self.client = anthropic.Anthropic()
         self.model, self.effort, self.keep, self.fallbacks, self.web = model, effort, history, fallbacks, web
         self.messages = []      # alternating user (picture) / assistant (text); assistant turns are plain text
+        self.wallet = None      # Wallet: estimated spending, filled per API response
 
     def _extra(self):
         """Fallback parameters for models that have server-side fallbacks, else nothing."""
@@ -723,8 +829,9 @@ class ClaudeChat:
 
         @beta_tool(name="run_command", input_schema=COMMAND_SCHEMA,
                    description="Run a bot command that someone sent in the room: a message that starts with a slash, "
-                               "such as /debug, /debug off, /model haiku, /host, /help. Returns the bot's answer; "
-                               "confirm it in a few words (for /host and /help show the returned information).")
+                               "such as /debug, /debug off, /model haiku, /host, /wallet, /help. Returns the bot's answer; "
+                               "confirm it in a few words (for /host, /wallet and /help show the returned "
+                               "information).")
         def run_command_tool(command):
             if run_command is None:
                 return "Commands are not available here."
@@ -751,6 +858,8 @@ class ClaudeChat:
             for message in self.client.beta.messages.tool_runner(**kwargs):
                 last = message
                 u = message.usage
+                if self.wallet is not None:
+                    self.wallet.add(request_cost(self.model, u))
                 cached = u.cache_read_input_tokens or 0
                 usage_in += u.input_tokens + cached + (u.cache_creation_input_tokens or 0)
                 usage_cached += cached
@@ -786,7 +895,9 @@ class ClaudeChat:
             summary = (summary + " " if summary else "") + "[I ran the command %s.]" % c
         self.messages += [user, {"role": "assistant", "content": summary}]
         if len(self.messages) > 2 * self.keep:
-            self.messages = self.messages[-2 * self.keep:]
+            # trim in steps (down to half), not by one exchange per message: dropping the oldest exchange every time
+            # changes the start of the history on every request, so the cached conversation was never reused
+            self.messages = self.messages[-2 * max(1, self.keep // 2):]
         return "ok, %d drawing(s), %d image(s), %d QR code(s), %d in / %d out tokens (%d of the input from cache)" % (
             len(drawn), len(sent_images), len(sent_qr), usage_in, usage_out, usage_cached)
 
@@ -811,7 +922,11 @@ class ClaudeChat:
         send_text(text)
         self.messages += [user, {"role": "assistant", "content": text}]
         if len(self.messages) > 2 * self.keep:
-            self.messages = self.messages[-2 * self.keep:]
+            # trim in steps (down to half), not by one exchange per message: dropping the oldest exchange every time
+            # changes the start of the history on every request, so the cached conversation was never reused
+            self.messages = self.messages[-2 * max(1, self.keep // 2):]
+        if self.wallet is not None:
+            self.wallet.add(request_cost(self.model, message.usage))
         return "ok, %d in / %d out tokens" % (message.usage.input_tokens, message.usage.output_tokens)
 
 
@@ -966,6 +1081,9 @@ def main():
 
     a.model = resolve_model(a.model)
     chat = None if a.dry_run else ClaudeChat(a.model, a.effort, a.history, not a.no_fallbacks, not a.no_web)
+    wallet = Wallet()
+    if chat:
+        chat.wallet = wallet
     if chat:
         if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
             print("note: ANTHROPIC_API_KEY is not set in this terminal")
@@ -1106,7 +1224,7 @@ def main():
 
     def command(line):
         """Bot commands, typed in the terminal or sent from a DS (Claude passes them on through run_command):
-        /model [name], /effort [level], /debug [on|off], /host, /help. Logs and returns the answer as text."""
+        /model [name], /effort [level], /debug [on|off], /host, /wallet, /help. Logs and returns the answer."""
         out = []
 
         def log(text):
@@ -1151,11 +1269,18 @@ def main():
         elif cmd == "/debug":
             a.debug = {"on": True, "off": False}.get(arg, not a.debug) if arg in ("on", "off", "") else a.debug
             log("debug lines in the room: %s" % ("on" if a.debug else "off"))
+        elif cmd == "/wallet":
+            log(wallet.summary())
+            org = org_costs()
+            log(org if org else "remaining credit: not readable by the API, see console.anthropic.com (Plans & "
+                                "Billing); with an Admin API key in ANTHROPIC_ADMIN_KEY, /wallet also shows "
+                                "Anthropic's own cost report")
         elif cmd == "/host":
             log("host: " + host_status(room.state))
         elif cmd in ("/help", "/?"):
             log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], "
-                "/debug [on|off], /host (status of the machine: disk, memory, temperature, Wi-Fi, room), /help")
+                "/debug [on|off], /host (status of the machine: disk, memory, temperature, Wi-Fi, room), "
+                "/wallet (money spent), /help")
         else:
             log("unknown command %r (try /help)" % cmd)
         return "; ".join(out)
