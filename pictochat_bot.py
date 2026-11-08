@@ -74,6 +74,12 @@ You can also draw: the draw_picture tool sends a picture of your own into the ro
 draw something, or when a quick sketch says it better than words. Keep drawings simple and bold (outlines, big
 shapes, a few colours) - the canvas is tiny. You can add a short text message before or after a drawing.
 
+A message that starts with a slash is a command for you as the bot: /debug (switch the small line with time and
+tokens after each reply on or off; "/debug on" or "/debug off" to set it), /model NAME (switch the model: haiku,
+sonnet, opus, fable), /effort LEVEL, /help (list the commands). Call run_command with the command exactly as
+written, then confirm the result in a few words in a small style (e.g. "[mono small] Debug mode on."). If you are
+not sure a slash message is meant as a command, just chat.
+
 When someone asks for a QR code (or a link that is hard to copy by hand), use send_qr_code: it sends a real,
 scannable code that a phone camera can read off the DS screen. It holds at most about 78 characters, so prefer
 short URLs. Say in a short text what the code contains."""
@@ -515,6 +521,15 @@ def qr_rows(text):
         qr.version, n, n, qr.error, scale)
 
 
+COMMAND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string", "description": "The command as written in the message, starting with a slash, "
+                                                     "e.g. '/debug', '/debug off', '/model haiku', '/help'."},
+    },
+    "required": ["command"],
+}
+
 QR_SCHEMA = {
     "type": "object",
     "properties": {
@@ -577,7 +592,7 @@ class ClaudeChat:
                            % (type(e).__name__, e.__cause__ or e,
                               "; proxy variables set: " + ", ".join(proxy) if proxy else ""))
 
-    def ask(self, pictures, send_text, send_picture):
+    def ask(self, pictures, send_text, send_picture, run_command=None):
         """Answer DS pictures: a list of (png bytes, sender label), usually one; several when they arrived while the
         previous reply was being made. Text goes out through send_text(str), drawings through send_picture(rows), in
         the order Claude produces them. Returns a short status string for the log."""
@@ -655,7 +670,24 @@ class ClaudeChat:
             content.append({"type": "text", "text": "These %d messages arrived in quick succession; answer them "
                                                     "together in one short reply." % len(pictures)})
         user = {"role": "user", "content": content}
-        tools = [draw_picture, send_qr_code] + ([send_image] + web_tools(self.model) if self.web else [])
+        commands_run = []
+
+        @beta_tool(name="run_command", input_schema=COMMAND_SCHEMA,
+                   description="Run a bot command that someone sent in the room: a message that starts with a slash, "
+                               "such as /debug, /debug off, /model haiku, /help. Returns the bot's answer; confirm it "
+                               "in a few words.")
+        def run_command_tool(command):
+            if run_command is None:
+                return "Commands are not available here."
+            if len(commands_run) >= 3:
+                return "Error: at most 3 commands per message."
+            text = str(command).strip()
+            if not text.startswith("/"):
+                return "Error: commands start with a slash, e.g. /debug."
+            commands_run.append(text)
+            return run_command(text) or "done"
+
+        tools = [draw_picture, send_qr_code, run_command_tool] + ([send_image] + web_tools(self.model) if self.web else [])
         kwargs = dict(model=self.model, max_tokens=4096, system=SYSTEM + (SYSTEM_WEB if self.web else ""),
                       messages=self.messages + [user], tools=tools, output_config={"effort": self.effort},
                       max_iterations=8)
@@ -683,7 +715,7 @@ class ClaudeChat:
             return "API error %s: %s" % (e.status_code, e.message)
         except self.anthropic.APIConnectionError as e:
             return "no connection to the API: %s (%r)" % (type(e).__name__, e.__cause__ or e)
-        if last is None or (not said and not drawn and not sent_images and not sent_qr):
+        if last is None or (not said and not drawn and not sent_images and not sent_qr and not commands_run):
             return "empty reply (stop_reason %s)" % (last.stop_reason if last else None)
         # only plain text goes into the history (no thinking or tool blocks), so trimming old turns is safe
         summary = " ".join(said)
@@ -693,6 +725,8 @@ class ClaudeChat:
             summary = (summary + " " if summary else "") + "[I sent an image from %s.]" % src
         for t in sent_qr:
             summary = (summary + " " if summary else "") + "[I sent a QR code for %r.]" % t
+        for c in commands_run:
+            summary = (summary + " " if summary else "") + "[I ran the command %s.]" % c
         self.messages += [user, {"role": "assistant", "content": summary}]
         if len(self.messages) > 2 * self.keep:
             self.messages = self.messages[-2 * self.keep:]
@@ -948,7 +982,8 @@ def main():
             send_picture(render_shapes(DEMO_SHAPES))
             info = "dry run"
         else:
-            info = chat.ask([(message_png(m), l) for m, l in zip(msgs, labels)], send_text, send_picture)
+            info = chat.ask([(message_png(m), l) for m, l in zip(msgs, labels)], send_text, send_picture,
+                            run_command=command)
         log("%s from %s -> %s" % ("message" if len(msgs) == 1 else "%d messages" % len(msgs),
                                   ", ".join(dict.fromkeys(labels)), info))
         after_request(info, started)
@@ -984,22 +1019,31 @@ def main():
                 import traceback
                 log("job %s failed:\n%s" % (job[0], traceback.format_exc().rstrip()))
 
+    log_line = log
+
     def command(line):
-        """Terminal commands: /model [name], /effort [level], /debug [on|off], /help."""
+        """Bot commands, typed in the terminal or sent from a DS (Claude passes them on through run_command):
+        /model [name], /effort [level], /debug [on|off], /help. Logs and returns the answer as text."""
+        out = []
+
+        def log(text):
+            out.append(text)
+            log_line(text)
+
         parts = line.split()
         if not parts:
-            return
+            return ""
         cmd, arg = parts[0].lower(), (parts[1] if len(parts) > 1 else "")
         if cmd == "/model":
             if not arg:
                 log("model: %s (aliases: %s; any model id works)" % (
                     ident["model"], ", ".join("%s = %s" % kv for kv in MODEL_ALIASES.items())))
-                return
+                return "; ".join(out)
             if chat:
                 ok, info = chat.set_model(arg)
                 log(info)
                 if not ok:
-                    return
+                    return "; ".join(out)
             ident["model"] = chat.model if chat else resolve_model(arg)
             if not chat:
                 log("now using %s (dry run: no API check)" % ident["model"])
@@ -1029,6 +1073,7 @@ def main():
                 "/debug [on|off], /help")
         else:
             log("unknown command %r (try /help)" % cmd)
+        return "; ".join(out)
 
     def stdin_reader():
         for line in sys.stdin:
