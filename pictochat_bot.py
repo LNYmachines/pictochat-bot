@@ -58,7 +58,11 @@ one short, warm greeting that uses the names given.
 
 You can also draw: the draw_picture tool sends a picture of your own into the room. Use it when someone asks you to
 draw something, or when a quick sketch says it better than words. Keep drawings simple and bold (outlines, big
-shapes, a few colours) - the canvas is tiny. You can add a short text message before or after a drawing."""
+shapes, a few colours) - the canvas is tiny. You can add a short text message before or after a drawing.
+
+When someone asks for a QR code (or a link that is hard to copy by hand), use send_qr_code: it sends a real,
+scannable code that a phone camera can read off the DS screen. It holds at most about 78 characters, so prefer
+short URLs. Say in a short text what the code contains."""
 
 SYSTEM_WEB = """
 
@@ -343,6 +347,51 @@ def render_shapes(shapes):
     return rows
 
 
+QR_QUIET = 2   # modules of blank paper around the code (the standard asks for 4; the bubble adds more on the sides)
+
+
+def qr_rows(text):
+    """A real, scannable QR code for `text` as 80 rows of 256 palette indices (black on paper), as large as the DS
+    picture allows: the smallest QR version that holds the text, at the largest whole number of pixels per module
+    that fits the 80-pixel height with a quiet zone, centred right of the name tab (columns 81-252).
+    Returns (rows, description); raises ValueError if the text is too long (about 78 bytes at most)."""
+    import segno
+    if not text:
+        raise ValueError("empty text")
+    try:
+        qr = segno.make_qr(text, error="l", boost_error=True)   # smallest version, then the best ECC that still fits
+    except segno.DataOverflowError:
+        raise ValueError("text too long for a QR code")
+    n = qr.symbol_size(scale=1, border=0)[0]
+    scale = gui.PH // (n + 2 * QR_QUIET)
+    if scale < 2:
+        raise ValueError("text too long: it needs a %dx%d QR code (version %s), which would be under 2 pixels per "
+                         "module on the DS; at most about 78 characters fit (fewer for non-ASCII)" % (n, n, qr.version))
+    side = n * scale
+    x_left = gui.TAB_X1 + 1
+    x0 = x_left + (gui.VIS_X1 + 1 - x_left - side) // 2
+    y0 = (gui.PH - side) // 2
+    rows = gui.blank()
+    for r, line in enumerate(qr.matrix):
+        for c, v in enumerate(line):
+            if v:
+                for dy in range(scale):
+                    rows[y0 + r * scale + dy][x0 + c * scale:x0 + (c + 1) * scale] = [1] * scale
+    return gui.clip(rows), "QR version %s (%dx%d), error correction %s, %d px per module" % (
+        qr.version, n, n, qr.error, scale)
+
+
+QR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string", "description": "What the code should contain: a URL, plain text, a phone number "
+                                                  "(tel:...), a Wi-Fi login (WIFI:T:WPA;S:name;P:password;;), etc. "
+                                                  "At most about 78 characters."},
+    },
+    "required": ["text"],
+}
+
+
 class ClaudeChat:
     """Keeps the recent conversation (pictures in, text out) and asks Claude for each new picture."""
 
@@ -394,9 +443,10 @@ class ClaudeChat:
                            % (type(e).__name__, e.__cause__ or e,
                               "; proxy variables set: " + ", ".join(proxy) if proxy else ""))
 
-    def ask(self, png, sender, send_text, send_picture):
-        """Answer one DS picture. Text goes out through send_text(str), drawings through send_picture(rows), in the
-        order Claude produces them. Returns a short status string for the log."""
+    def ask(self, pictures, send_text, send_picture):
+        """Answer DS pictures: a list of (png bytes, sender label), usually one; several when they arrived while the
+        previous reply was being made. Text goes out through send_text(str), drawings through send_picture(rows), in
+        the order Claude produces them. Returns a short status string for the log."""
         from anthropic import beta_tool
         drawn = []
 
@@ -437,12 +487,41 @@ class ClaudeChat:
                                              "data": base64.standard_b64encode(rows_png(rows, 2)).decode("ascii")}},
             ]
 
-        user = {"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
-                                         "data": base64.standard_b64encode(png).decode("ascii")}},
-            {"type": "text", "text": "New PictoChat message from %s." % sender},
-        ]}
-        tools = [draw_picture] + ([send_image] + web_tools(self.model) if self.web else [])
+        sent_qr = []
+
+        @beta_tool(name="send_qr_code", input_schema=QR_SCHEMA,
+                   description="Send a real, scannable QR code into the PictoChat room as its own message (black on "
+                               "white, as large as the DS picture allows; a phone camera can read it off the DS "
+                               "screen). Use it when someone asks for a QR code, or to hand over a link that is "
+                               "tedious to copy by hand. The text is encoded exactly as given, so check URLs. "
+                               "Returns a preview of what was sent.")
+        def send_qr_code(text):
+            if len(sent_qr) >= 3:
+                return "Error: at most 3 QR codes per reply. Nothing was sent."
+            try:
+                rows, info = qr_rows(str(text))
+            except ValueError as e:
+                return "Error: %s. Nothing was sent; shorten the text (e.g. a shorter URL) and try again." % e
+            send_picture(rows)
+            sent_qr.append(text)
+            return [
+                {"type": "text", "text": "QR code sent to the room (%s). This is what the DS shows:" % info},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                             "data": base64.standard_b64encode(rows_png(rows, 2)).decode("ascii")}},
+            ]
+
+        content = []
+        for png, sender in pictures:
+            content += [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                             "data": base64.standard_b64encode(png).decode("ascii")}},
+                {"type": "text", "text": "New PictoChat message from %s." % sender},
+            ]
+        if len(pictures) > 1:
+            content.append({"type": "text", "text": "These %d messages arrived in quick succession; answer them "
+                                                    "together in one short reply." % len(pictures)})
+        user = {"role": "user", "content": content}
+        tools = [draw_picture, send_qr_code] + ([send_image] + web_tools(self.model) if self.web else [])
         kwargs = dict(model=self.model, max_tokens=4096, system=SYSTEM + (SYSTEM_WEB if self.web else ""),
                       messages=self.messages + [user], tools=tools, output_config={"effort": self.effort},
                       max_iterations=8)
@@ -470,7 +549,7 @@ class ClaudeChat:
             return "API error %s: %s" % (e.status_code, e.message)
         except self.anthropic.APIConnectionError as e:
             return "no connection to the API: %s (%r)" % (type(e).__name__, e.__cause__ or e)
-        if last is None or (not said and not drawn and not sent_images):
+        if last is None or (not said and not drawn and not sent_images and not sent_qr):
             return "empty reply (stop_reason %s)" % (last.stop_reason if last else None)
         # only plain text goes into the history (no thinking or tool blocks), so trimming old turns is safe
         summary = " ".join(said)
@@ -478,11 +557,13 @@ class ClaudeChat:
             summary = (summary + " " if summary else "") + "[I sent %d drawing(s).]" % len(drawn)
         for src in sent_images:
             summary = (summary + " " if summary else "") + "[I sent an image from %s.]" % src
+        for t in sent_qr:
+            summary = (summary + " " if summary else "") + "[I sent a QR code for %r.]" % t
         self.messages += [user, {"role": "assistant", "content": summary}]
         if len(self.messages) > 2 * self.keep:
             self.messages = self.messages[-2 * self.keep:]
-        return "ok, %d drawing(s), %d image(s), %d in / %d out tokens" % (len(drawn), len(sent_images), usage_in,
-                                                                           usage_out)
+        return "ok, %d drawing(s), %d image(s), %d QR code(s), %d in / %d out tokens" % (
+            len(drawn), len(sent_images), len(sent_qr), usage_in, usage_out)
 
     def greet(self, event, send_text):
         """Say hello for a room event (a plain-text note such as 'You just entered the room. In the room: Ann, Bo.').
@@ -601,7 +682,25 @@ def main():
     ap.add_argument("--send-image", metavar="URL", help="TEST: download, dither and post this image (or page's "
                                                         "main image) to the room, then exit; no API calls")
     ap.add_argument("--colour", action="store_true", help="with --send-image: 16-colour instead of black and white")
+    ap.add_argument("--send-qr", metavar="TEXT", help="TEST: post a QR code for TEXT to the room, then exit; no API "
+                                                      "calls")
+    ap.add_argument("--qr-png", metavar="FILE", help="with --send-qr: only write a preview PNG, do not connect")
     a = ap.parse_args()
+    if a.send_qr:
+        try:
+            rows, info = qr_rows(a.send_qr)
+        except ValueError as e:
+            sys.exit("send-qr failed: %s" % e)
+        if a.qr_png:
+            with open(a.qr_png, "wb") as fh:
+                fh.write(rows_png(rows, 4))
+            print("wrote %s (%s)" % (a.qr_png, info))
+            return
+        s = socket.create_connection((a.host, a.port), timeout=3)
+        s.sendall((json.dumps({"cmd": "chat", "pixels": rows}) + "\n").encode())
+        s.close()
+        print("sent QR code for %r (%s)" % (a.send_qr, info))
+        return
 
     if a.send_image:
         try:
@@ -670,23 +769,46 @@ def main():
                 info = chat.greet(event, send_text)
             log("greeting (%s) -> %s" % (name_list(names) or "everyone", info))
             return
-        msg = job[1]
-        who = sender_of(msg)
-        who_name = room.names.get(who)
-        label = "%s (%s)" % (who_name, who) if who_name else who
+        msgs = job[1]
+        labels = []
+        for msg in msgs:
+            who = sender_of(msg)
+            who_name = room.names.get(who)
+            labels.append("%s (%s)" % (who_name, who) if who_name else who)
         if a.dry_run:
-            send_text("I got your picture (%d bytes). Bot is in dry-run mode; here is a test drawing." % len(msg))
+            send_text("I got %d picture(s). Bot is in dry-run mode; here is a test drawing." % len(msgs))
             send_picture(render_shapes(DEMO_SHAPES))
             info = "dry run"
         else:
-            info = chat.ask(message_png(msg), label, send_text, send_picture)
-        log("message from %s -> %s" % (label, info))
+            info = chat.ask([(message_png(m), l) for m, l in zip(msgs, labels)], send_text, send_picture)
+        log("%s from %s -> %s" % ("message" if len(msgs) == 1 else "%d messages" % len(msgs),
+                                  ", ".join(dict.fromkeys(labels)), info))
+
+    later = []
+
+    def next_job():
+        """The next job; chat messages that are already waiting are merged into one job, so several pictures sent
+        in quick succession get one reply instead of one each (each reply keeps the room busy for about a second)."""
+        job = later.pop(0) if later else work.get()
+        if job[0] != "chat":
+            return job
+        msgs = [job[1]]
+        while len(msgs) < 6:
+            try:
+                nxt = work.get_nowait()
+            except queue.Empty:
+                break
+            if nxt[0] == "chat":
+                msgs.append(nxt[1])
+            else:
+                later.append(nxt)
+        return ("chat", msgs)
 
     def worker():
         # one failed job (API error, broken picture, missing library) must not stop the bot: the process would
         # keep running with a dead worker, so a service manager would never restart it
         while True:
-            job = work.get()
+            job = next_job()
             try:
                 handle_job(job)
             except Exception:  # noqa: BLE001
