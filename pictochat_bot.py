@@ -214,10 +214,25 @@ SEND_IMAGE_SCHEMA = {
     "additionalProperties": False,
 }
 
-WEB_TOOLS = [
-    {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
-    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 3},
-]
+MODEL_ALIASES = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5",
+                 "fable": "claude-fable-5-1"}
+# server-side refusal fallbacks exist only for these (Claude Haiku 5.5 has none: a fallback list there is a 400)
+FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
+# the dynamic-filtering web tool versions are documented for these; every other model gets the basic versions
+DYNAMIC_WEB_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+                      "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6"}
+
+
+def web_tools(model):
+    search, fetch = (("web_search_20260209", "web_fetch_20260209") if model in DYNAMIC_WEB_MODELS
+                     else ("web_search_20250305", "web_fetch_20250910"))
+    return [{"type": search, "name": "web_search", "max_uses": 3},
+            {"type": fetch, "name": "web_fetch", "max_uses": 3}]
+
+
+def resolve_model(name):
+    name = name.strip().lower()
+    return MODEL_ALIASES.get(name, name)
 
 
 def reply_pictures(text, color=1, max_pages=3):
@@ -338,6 +353,22 @@ class ClaudeChat:
         self.model, self.effort, self.keep, self.fallbacks, self.web = model, effort, history, fallbacks, web
         self.messages = []      # alternating user (picture) / assistant (text); assistant turns are plain text
 
+    def _extra(self):
+        """Fallback parameters for models that have server-side fallbacks, else nothing."""
+        if self.fallbacks and self.model in FALLBACK_MODELS:
+            return dict(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
+        return {}
+
+    def set_model(self, name):
+        """Switch to another model after a free lookup confirms this key can use it. Returns (ok, message)."""
+        new = resolve_model(name)
+        old, self.model = self.model, new
+        ok, info = self.check()
+        if not ok:
+            self.model = old
+            return False, info + "; still using %s" % old
+        return True, "now using %s" % new
+
     def check(self):
         """Free start-up check (a model lookup, no tokens billed): key, network and model access."""
         a = self.anthropic
@@ -347,7 +378,7 @@ class ClaudeChat:
         except a.AuthenticationError:
             return False, "the API rejected the key: is ANTHROPIC_API_KEY set in this terminal and complete?"
         except a.NotFoundError:
-            return False, "model %s is not available to this key (try --model claude-sonnet-5-5)" % self.model
+            return False, "model %s is not available to this key (try /model haiku)" % self.model
         except a.APIStatusError as e:
             return False, "API error %s: %s" % (e.status_code, e.message)
         except a.APIConnectionError as e:
@@ -411,13 +442,11 @@ class ClaudeChat:
                                          "data": base64.standard_b64encode(png).decode("ascii")}},
             {"type": "text", "text": "New PictoChat message from %s." % sender},
         ]}
-        tools = [draw_picture] + ([send_image] + WEB_TOOLS if self.web else [])
+        tools = [draw_picture] + ([send_image] + web_tools(self.model) if self.web else [])
         kwargs = dict(model=self.model, max_tokens=4096, system=SYSTEM + (SYSTEM_WEB if self.web else ""),
                       messages=self.messages + [user], tools=tools, output_config={"effort": self.effort},
                       max_iterations=8)
-        if self.fallbacks:
-            # on a safety decline the API retries on a fallback model inside the same request
-            kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
+        kwargs.update(self._extra())    # on a safety decline the API retries on a fallback model (where it exists)
         said, usage_in, usage_out, last = [], 0, 0, None
         try:
             for message in self.client.beta.messages.tool_runner(**kwargs):
@@ -461,8 +490,7 @@ class ClaudeChat:
         user = {"role": "user", "content": "[Room event] " + event}
         kwargs = dict(model=self.model, max_tokens=2048, system=SYSTEM, messages=self.messages + [user],
                       output_config={"effort": self.effort})
-        if self.fallbacks:
-            kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
+        kwargs.update(self._extra())
         try:
             message = self.client.beta.messages.create(**kwargs)
         except self.anthropic.APIStatusError as e:
@@ -556,7 +584,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7777, help="the host's --gui-port")
-    ap.add_argument("--model", default="claude-opus-5-5")
+    ap.add_argument("--model", default="claude-haiku-5-5", help="model id, or an alias: haiku (default), sonnet, opus, fable; change it while running with /model")
     ap.add_argument("--effort", default="low", choices=["low", "medium", "high", "xhigh", "max"],
                     help="reasoning effort per reply (low keeps chat replies quick)")
     ap.add_argument("--history", type=int, default=10, help="how many earlier exchanges Claude sees")
@@ -587,6 +615,7 @@ def main():
         print("sent image from %s (%d bytes downloaded)" % (src, len(data)))
         return
 
+    a.model = resolve_model(a.model)
     chat = None if a.dry_run else ClaudeChat(a.model, a.effort, a.history, not a.no_fallbacks, not a.no_web)
     if chat:
         if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
@@ -629,7 +658,7 @@ def main():
         log("reply: (drawing)")
         post(gui.clip(rows))
 
-    my_name = (a.bot_name or bot_name(a.model))[:10]
+    ident = {"name": (a.bot_name or bot_name(a.model))[:10], "model": a.model}
 
     def worker():
         while True:
@@ -637,7 +666,7 @@ def main():
             if job[0] == "greet":
                 _, event, names = job
                 if a.dry_run:
-                    send_text("Hi %s! I'm %s, happy to chat." % (name_list(names) or "everyone", my_name))
+                    send_text("Hi %s! I'm %s, happy to chat." % (name_list(names) or "everyone", ident["name"]))
                     info = "dry run"
                 else:
                     info = chat.greet(event, send_text)
@@ -655,14 +684,66 @@ def main():
                 info = chat.ask(message_png(msg), label, send_text, send_picture)
             log("message from %s -> %s" % (label, info))
 
+    def command(line):
+        """Terminal commands: /model [name], /effort [level], /help."""
+        parts = line.split()
+        if not parts:
+            return
+        cmd, arg = parts[0].lower(), (parts[1] if len(parts) > 1 else "")
+        if cmd == "/model":
+            if not arg:
+                log("model: %s (aliases: %s; any model id works)" % (
+                    ident["model"], ", ".join("%s = %s" % kv for kv in MODEL_ALIASES.items())))
+                return
+            if chat:
+                ok, info = chat.set_model(arg)
+                log(info)
+                if not ok:
+                    return
+            ident["model"] = chat.model if chat else resolve_model(arg)
+            if not chat:
+                log("now using %s (dry run: no API check)" % ident["model"])
+            if not a.bot_name and not a.keep_name:
+                ident["name"] = bot_name(ident["model"])
+                s = sock_holder.get("s")
+                if s:
+                    try:
+                        s.sendall((json.dumps({"cmd": "set_name", "name": ident["name"]}) + "\n").encode())
+                        log("room nickname: %s (DSes see it when they next join)" % ident["name"])
+                    except OSError:
+                        pass
+        elif cmd == "/effort":
+            levels = ("low", "medium", "high", "xhigh", "max")
+            if arg in levels:
+                a.effort = arg
+                if chat:
+                    chat.effort = arg
+                log("effort: %s" % arg)
+            else:
+                log("effort: %s (choose one of %s)" % (a.effort, ", ".join(levels)))
+        elif cmd in ("/help", "/?"):
+            log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], /help")
+        else:
+            log("unknown command %r (try /help)" % cmd)
+
+    def stdin_reader():
+        for line in sys.stdin:
+            try:
+                command(line.strip())
+            except Exception as e:  # noqa: BLE001 - a bad command must not kill the bot
+                log("command failed: %s" % e)
+
     room = Room()
     threading.Thread(target=worker, daemon=True).start()
+    if sys.stdin:
+        threading.Thread(target=stdin_reader, daemon=True).start()
+        log("model %s; type /model to see or change it, /help for all commands" % a.model)
     while True:
         s = connect()
         sock_holder["s"] = s
         if not a.keep_name:
-            s.sendall((json.dumps({"cmd": "set_name", "name": my_name}) + "\n").encode())
-            log("room nickname: %s (DSes that join from now on see it; rejoin the room to see the new name)" % my_name)
+            s.sendall((json.dumps({"cmd": "set_name", "name": ident["name"]}) + "\n").encode())
+            log("room nickname: %s (DSes that join from now on see it; rejoin the room to see the new name)" % ident["name"])
         t_conn = time.time()
         ignore_until = 0 if a.answer_backlog else t_conn + 1.5        # the host replays its history on connect
         entry_done = a.no_greet
@@ -680,7 +761,7 @@ def main():
                             room.greeted[m] = now
                         known = [n for n in names if n]
                         event = ("You (%s) just entered the PictoChat room. In the room: %s%s. Say hi to everyone, "
-                                 "by name." % (my_name, name_list(known) or "people",
+                                 "by name." % (ident["name"], name_list(known) or "people",
                                                " and %d more" % (len(names) - len(known)) if known and
                                                len(known) < len(names) else ""))
                         work.put(("greet", event, names))
