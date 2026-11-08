@@ -93,6 +93,12 @@ class ClaudeChat:
         except a.APIStatusError as e:
             return False, "API error %s: %s" % (e.status_code, e.message)
         except a.APIConnectionError as e:
+            cause = e.__cause__
+            if cause is not None and not isinstance(cause, OSError) and "Error" in type(cause).__name__ \
+                    and type(cause).__module__ == "builtins":
+                import traceback
+                print("internal error inside the HTTP library (not a network problem); traceback:")
+                traceback.print_exception(cause)
             proxy = [k for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
                      if os.environ.get(k)]
             return False, ("cannot reach api.anthropic.com: %s (%r)%s. Run with ANTHROPIC_LOG=debug for details."
