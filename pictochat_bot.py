@@ -30,6 +30,7 @@ import io
 import json
 import os
 import queue
+import re
 import socket
 import sys
 import threading
@@ -46,8 +47,21 @@ Each message you receive is a small picture (256 x 80 pixels, shown enlarged): h
 text typed on the DS keyboard, or a drawing. Read it and reply as a friendly chat partner.
 
 Your reply is drawn as text into the same small picture format, about 33 characters per line and 4 lines per
-picture, so keep replies short: one to three sentences, usually under 120 characters, unless the person clearly
-asks for something longer. Write plain text only: no markdown, no emoji, no lists.
+picture at the normal size, so keep replies short: one to three sentences, usually under 120 characters, unless the
+person clearly asks for something longer. Write plain text only: no markdown, no emoji, no lists.
+
+Start each reply with a style tag in square brackets that matches its mood: a font, a size and optionally a colour,
+e.g. "[comic big orange] Haha, nice one!". The tag is not shown; it sets how your words are drawn.
+- fonts: plain (neutral, default), bold (excited, emphatic, loud), comic (playful, joking, silly), script
+  (romantic, fancy, poetic, congratulations), serif (serious, wise, storytelling, formal), italic (whispering,
+  dreamy, sarcastic, thoughtful), mono (robotic, technical, deadpan), retro (games, pixel art, nostalgia)
+- sizes: small (whispers, longer answers: more words per line), normal (4 lines per picture), big (2 lines:
+  excitement, short replies), huge (one line of 1-2 words: shouting, YAY, NO!); script runs larger, so use it with
+  small or normal
+- colours (optional, default black): black, magenta, pink, red, red-orange, orange, yellow-green, green,
+  cyan-green, sky-blue, blue, deep-blue, violet; avoid yellow and grey for text, they are hard to read
+Vary the style with the conversation's mood rather than using one style for everything; a plain, normal reply needs
+no colour. Bigger sizes hold fewer words, so keep big and huge replies very short.
 
 If a picture is a drawing without words, react to what it shows. If you cannot read the writing, say what you can
 make out and ask. Earlier pictures in the conversation are earlier messages of the same room.
@@ -237,6 +251,126 @@ def web_tools(model):
 def resolve_model(name):
     name = name.strip().lower()
     return MODEL_ALIASES.get(name, name)
+
+
+# ---------------------------------------------------------------- text styles (font, size, colour by mood)
+# A reply may start with a style tag such as "[comic big red]": known words in any order, removed before drawing.
+# Font files are looked up by name (Pillow searches the system font folders); the first one found is used, and
+# DejaVu Sans when none is. On Debian/Raspberry Pi OS: fonts-dejavu-core, fonts-dejavu-extra (italic),
+# fonts-comic-neue (comic), fonts-urw-base35 (script).
+FONT_FILES = {
+    "plain": ["DejaVuSans.ttf"],
+    "bold": ["DejaVuSans-Bold.ttf"],
+    "italic": ["DejaVuSans-Oblique.ttf", "DejaVuSerif-Italic.ttf"],
+    "serif": ["DejaVuSerif.ttf"],
+    "comic": ["ComicNeue-Bold.otf", "ComicNeue-Regular.otf"],
+    "script": ["Z003-MediumItalic.otf", "Z003-MediumItalic.t1"],
+    "mono": ["DejaVuSansMono.ttf"],
+    "retro": ["DejaVuSansMono-Bold.ttf", "DejaVuSansMono.ttf"],   # drawn at half size without smoothing, doubled
+}
+FONT_SIZES = {"small": 11, "normal": 13, "big": 20, "huge": 30}
+FONT_SCALE = {"script": 1.35, "comic": 1.1, "retro": 1.2}   # these look small at the same nominal size
+FONT_MIN = {"script": 16, "retro": 8}   # thinner or blockier fonts need more pixels to stay readable on the DS
+STYLE_TAG = re.compile(r"^\s*\[([a-z\- ]+)\]\s*")
+_font_cache = {}
+
+
+def parse_style(text):
+    """Split an optional leading style tag off a reply: ('comic', 'big', colour index or None), rest of the text.
+    A bracket at the start that contains other words is left alone (it may be part of the message)."""
+    m = STYLE_TAG.match(text)
+    if not m:
+        return ("plain", "normal", None), text
+    words = m.group(1).split()
+    if not words or not all(w in FONT_FILES or w in FONT_SIZES or w in COLORS for w in words):
+        return ("plain", "normal", None), text
+    font = next((w for w in words if w in FONT_FILES), "plain")
+    size = next((w for w in words if w in FONT_SIZES), "normal")
+    colour = next((COLORS[w] for w in words if w in COLORS and COLORS[w] != 0), None)
+    return (font, size, colour), text[m.end():]
+
+
+def load_font(font, px):
+    from PIL import ImageFont
+    key = (font, px)
+    if key not in _font_cache:
+        f = None
+        for name in FONT_FILES.get(font, []) + ["DejaVuSans.ttf"]:
+            try:
+                f = ImageFont.truetype(name, px)
+                break
+            except OSError:
+                continue
+        _font_cache[key] = f or ImageFont.load_default()
+    return _font_cache[key]
+
+
+def styled_pages(text, style=("plain", "normal", None), color=1, max_pages=3):
+    """Render a reply in the given style into PictoChat pictures (80 rows of 256 palette indices each): word-wrapped
+    to the visible width below the name tab (columns 26-252, rows 16-79), as many lines per picture as the font
+    size allows, at most max_pages pictures (the last one ends in '...' if the text is longer)."""
+    from PIL import Image, ImageDraw
+    font_name, size_name, colour = style
+    colour = colour or color
+    retro = font_name == "retro"
+    k = 2 if retro else 1                                   # retro: draw at half resolution, then double
+    px = max(FONT_MIN.get(font_name, 6), round(FONT_SIZES[size_name] * FONT_SCALE.get(font_name, 1.0) / k))
+    font = load_font(font_name, px)
+    x0, x1, y0, y1 = gui.TEXT_X0, gui.TEXT_X1, gui.TAB_Y1 + 1, gui.PH - 1
+    width, height = (x1 - x0) // k, (y1 - y0 + 1) // k
+    d = ImageDraw.Draw(Image.new("L", (1, 1)))
+    line_h = max(px + 1, round(px * 1.22))                # 16 px at the normal 13 px, like the GUI's text
+    per_page = max(1, height // line_h)
+
+    def fits(s):
+        return d.textlength(s, font=font) <= width
+
+    lines = []
+    for para in text.strip().split("\n"):
+        cur = ""
+        for word in para.split(" "):
+            while not fits(word):                           # a word wider than the picture: break it
+                cut = len(word) - 1
+                while cut > 1 and not fits(word[:cut]):
+                    cut -= 1
+                if cur:
+                    lines.append(cur)
+                    cur = ""
+                lines.append(word[:cut])
+                word = word[cut:]
+            trial = (cur + " " + word).strip()
+            if fits(trial) or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+        lines.append(cur)
+    pages = [lines[i:i + per_page] for i in range(0, len(lines), per_page)] or [[""]]
+    if len(pages) > max_pages:
+        pages = pages[:max_pages]
+        last = pages[-1][-1]
+        while last and not fits(last + "..."):
+            last = last[:-1]
+        pages[-1][-1] = last + "..."
+    out = []
+    for page in pages:
+        img = Image.new("L", (width, height), 0)
+        dr = ImageDraw.Draw(img)
+        if retro:
+            dr.fontmode = "1"                               # no smoothing: crisp pixels
+        top = 0 if len(page) > 1 or per_page > 2 else (height - line_h) // 2   # a lone big line sits in the middle
+        for i, ln in enumerate(page):
+            dr.text((0, top + i * line_h), ln, fill=255, font=font)
+        if k != 1:
+            img = img.resize((width * k, height * k), Image.NEAREST)
+        rows = gui.blank()
+        p = img.load()
+        for y in range(img.height):
+            for x in range(img.width):
+                if p[x, y] > 110:
+                    rows[y0 + y][x0 + x] = colour
+        out.append(gui.clip(rows))
+    return out
 
 
 def reply_pictures(text, color=1, max_pages=3):
@@ -748,8 +882,10 @@ def main():
             return False
 
     def send_text(text):
-        log("reply: %s" % text)
-        for px in reply_pictures(text, a.color, a.max_pages):
+        style, body = parse_style(text)
+        log("reply%s: %s" % ("" if style == ("plain", "normal", None) else " [%s %s%s]" % (
+            style[0], style[1], " colour %d" % style[2] if style[2] else ""), body))
+        for px in styled_pages(body, style, a.color, a.max_pages):
             if not post(px):
                 break
 
