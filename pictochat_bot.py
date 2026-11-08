@@ -16,6 +16,12 @@ Run:
     .venv/bin/python pictochat_bot.py --dry-run   # no API calls: answers with a fixed text (for testing)
 
 Each reply costs one Messages API request (the picture is about 300 input tokens, plus the recent conversation).
+Replies that use the web cost more: web_search results add input tokens, and each search is billed per use.
+
+Tools Claude can use: draw_picture (vector shapes), send_image (download a picture and dither it like the GUI's
+"Load image..."), web_search and web_fetch (server-side). --no-web turns off the last three. Downloads only go to
+public http(s) addresses (never this machine or the local network), at most 8 MB, 3 images per reply.
+    .venv/bin/python pictochat_bot.py --send-image URL   # test the image path without API calls
 """
 import argparse
 import base64
@@ -50,17 +56,164 @@ You can also draw: the draw_picture tool sends a picture of your own into the ro
 draw something, or when a quick sketch says it better than words. Keep drawings simple and bold (outlines, big
 shapes, a few colours) - the canvas is tiny. You can add a short text message before or after a drawing."""
 
+SYSTEM_WEB = """
+
+You can also send real pictures from the web: find one with web_search (and web_fetch if you need to look inside a
+page), then call send_image with the image URL. A page URL works too: send_image then takes the page's main image.
+Use this when someone asks to see something real (an animal, a place, a famous picture, a logo). The picture is
+shrunk to 230 x 64 pixels and dithered to black and white like a newspaper photo, so pick images with one clear,
+large subject and strong contrast; set colour=true for colourful subjects. You see the result after sending; if it
+came out unrecognisable, you may try one better image. Only search when it helps - a plain chat reply needs no web
+access. If someone asks a factual question about current events, a quick web_search is fine too."""
+
 
 def message_png(msg, scale=3):
     """PNG (bytes) of a `03 02` chat message's picture, enlarged `scale` times, in the DS's colours."""
+    return rows_png(gui.decode_image(msg), scale)
+
+
+def rows_png(rows, scale=3):
+    """PNG (bytes) of an 80 x 256 PictoChat picture (palette indices), enlarged `scale` times."""
     from PIL import Image
-    rows = gui.decode_image(msg)
     img = Image.new("RGB", (gui.PW, gui.PH))
     img.putdata([gui.PALETTE.get(v, (128, 128, 128)) for r in rows for v in r])
     img = img.resize((gui.PW * scale, gui.PH * scale), Image.NEAREST)
     out = io.BytesIO()
     img.save(out, "PNG")
     return out.getvalue()
+
+
+# ---------------------------------------------------------------- image download (send_image tool)
+MAX_DOWNLOAD = 8 * 1024 * 1024
+USER_AGENT = "pictochat-bot/1.0 (hobby project; fetches one image per request)"
+
+
+class FetchError(Exception):
+    pass
+
+
+def _check_url(url):
+    """Allow only http(s) URLs whose host resolves to public addresses only, so a model-chosen URL can never reach
+    this machine or the local network (the host's GUI port, the router, ...)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise FetchError("only http(s) URLs are allowed")
+    try:
+        infos = socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise FetchError("cannot resolve %s (%s)" % (u.hostname, e)) from None
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise FetchError("%s resolves to a non-public address" % u.hostname)
+
+
+def http_get(url, max_bytes=MAX_DOWNLOAD, timeout=10, redirects=5):
+    """GET with every redirect target re-checked by _check_url and a size cap. Returns (content_type, data, url)."""
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urljoin
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    for _ in range(redirects + 1):
+        _check_url(url)
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "image/*,text/html;q=0.8,*/*;q=0.5"})
+        try:
+            resp = opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
+                url = urljoin(url, e.headers["Location"])
+                continue
+            raise FetchError("HTTP %d from %s" % (e.code, url)) from None
+        except (urllib.error.URLError, OSError) as e:
+            raise FetchError("download failed: %s" % getattr(e, "reason", e)) from None
+        with resp:
+            data = resp.read(max_bytes + 1)
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if len(data) > max_bytes:
+            raise FetchError("file larger than %d MB" % (max_bytes // (1024 * 1024)))
+        return ctype, data, url
+    raise FetchError("too many redirects")
+
+
+def page_image_url(html_bytes, base):
+    """The main image of an HTML page: og:image, twitter:image, link rel=image_src, else the first <img>."""
+    import html
+    import re
+    from urllib.parse import urljoin
+    text = html_bytes[:2_000_000].decode("utf-8", "replace")
+    pats = [r'<meta[^>]+(?:property|name)=["\'](?:og:image(?::url|:secure_url)?|twitter:image(?::src)?)["\'][^>]*?'
+            r'content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*?(?:property|name)=["\'](?:og:image|twitter:image)',
+            r'<link[^>]+rel=["\']image_src["\'][^>]*?href=["\']([^"\']+)',
+            r'<img[^>]+src=["\']([^"\']+\.(?:jpe?g|png|webp|gif)(?:\?[^"\']*)?)["\']']
+    for p in pats:
+        m = re.search(p, text, re.I)
+        if m:
+            return urljoin(base, html.unescape(m.group(1)))
+    return None
+
+
+def download_image(url):
+    """Image bytes for `url`: an image URL, or a web page whose main image is used. Returns (data, image_url)."""
+    ctype, data, final = http_get(url)
+    if ctype.startswith("image/") or (not ctype.startswith("text/") and _looks_like_image(data)):
+        return data, final
+    if "html" in ctype or data.lstrip()[:1] == b"<":
+        img = page_image_url(data, final)
+        if not img:
+            raise FetchError("the page has no recognisable main image; pass a direct image URL")
+        ctype, data, final = http_get(img)
+        if ctype.startswith("image/") or _looks_like_image(data):
+            return data, final
+    raise FetchError("not an image (content type %r)" % ctype)
+
+
+def _looks_like_image(data):
+    from PIL import Image
+    try:
+        Image.open(io.BytesIO(data)).verify()
+        return True
+    except Exception:  # noqa: BLE001 - any Pillow failure means "not an image we can read"
+        return False
+
+
+def image_rows(data, colour=False, dither=True, invert=False):
+    """Convert image bytes exactly like the GUI's "Load image...": fit 230 x 64 below the name tab, dither."""
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = 50_000_000          # Pillow refuses larger images (decompression bombs)
+    try:
+        return gui.clip(gui.image_to_pixels(io.BytesIO(data), dither=dither, invert=invert, color=colour))
+    except Image.DecompressionBombError:
+        raise FetchError("image too large") from None
+    except Exception as e:  # noqa: BLE001 - Pillow raises many types for broken files
+        raise FetchError("cannot read the image: %s" % e) from None
+
+
+SEND_IMAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "http(s) URL of an image, or of a web page (its main image is used)"},
+        "colour": {"type": "boolean", "description": "map to the 16 PictoChat colours instead of black and white "
+                                                     "(default false)"},
+        "dither": {"type": "boolean", "description": "Floyd-Steinberg dithering (default true); false = hard threshold,"
+                                                     " good for logos and line art"},
+        "invert": {"type": "boolean", "description": "invert brightness first (default false)"},
+    },
+    "required": ["url"],
+    "additionalProperties": False,
+}
+
+WEB_TOOLS = [
+    {"type": "web_search_20260209", "name": "web_search", "max_uses": 3},
+    {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 3},
+]
 
 
 def reply_pictures(text, color=1, max_pages=3):
@@ -174,11 +327,11 @@ def render_shapes(shapes):
 class ClaudeChat:
     """Keeps the recent conversation (pictures in, text out) and asks Claude for each new picture."""
 
-    def __init__(self, model, effort, history, fallbacks=True):
+    def __init__(self, model, effort, history, fallbacks=True, web=True):
         import anthropic
         self.anthropic = anthropic
         self.client = anthropic.Anthropic()
-        self.model, self.effort, self.keep, self.fallbacks = model, effort, history, fallbacks
+        self.model, self.effort, self.keep, self.fallbacks, self.web = model, effort, history, fallbacks, web
         self.messages = []      # alternating user (picture) / assistant (text); assistant turns are plain text
 
     def check(self):
@@ -226,13 +379,38 @@ class ClaudeChat:
             drawn.append(len(shapes))
             return "The picture was sent to the room (%d shapes)." % len(shapes)
 
+        sent_images = []
+
+        @beta_tool(name="send_image", input_schema=SEND_IMAGE_SCHEMA,
+                   description="Download a picture from the web and send it into the PictoChat room as its own "
+                               "message, converted like PictoChat's image import: shrunk to 230 x 64 pixels and "
+                               "dithered to black and white (or mapped to the 16 PictoChat colours with colour=true)."
+                               " Returns a preview of exactly what was sent.")
+        def send_image(url, colour=False, dither=True, invert=False):
+            if len(sent_images) >= 3:
+                return "Error: at most 3 images per reply. Nothing was sent."
+            try:
+                data, src = download_image(str(url))
+                rows = image_rows(data, colour=bool(colour), dither=bool(dither), invert=bool(invert))
+            except FetchError as e:
+                return "Error: %s. Nothing was sent." % e
+            send_picture(rows)
+            sent_images.append(src)
+            return [
+                {"type": "text", "text": "Sent to the room (image from %s). This is what the DS shows:" % src},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                             "data": base64.standard_b64encode(rows_png(rows, 2)).decode("ascii")}},
+            ]
+
         user = {"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png",
                                          "data": base64.standard_b64encode(png).decode("ascii")}},
             {"type": "text", "text": "New PictoChat message from %s." % sender},
         ]}
-        kwargs = dict(model=self.model, max_tokens=4096, system=SYSTEM, messages=self.messages + [user],
-                      tools=[draw_picture], output_config={"effort": self.effort}, max_iterations=4)
+        tools = [draw_picture] + ([send_image] + WEB_TOOLS if self.web else [])
+        kwargs = dict(model=self.model, max_tokens=4096, system=SYSTEM + (SYSTEM_WEB if self.web else ""),
+                      messages=self.messages + [user], tools=tools, output_config={"effort": self.effort},
+                      max_iterations=8)
         if self.fallbacks:
             # on a safety decline the API retries on a fallback model inside the same request
             kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
@@ -246,7 +424,8 @@ class ClaudeChat:
                     send_text("Sorry, I can't answer that one.")
                     return "refused (%s)" % getattr(message.stop_details, "category", None)
                 # each message is yielded before its tool calls run, so text and drawings keep their order
-                text = " ".join(b.text for b in message.content if b.type == "text").strip()
+                # cited answers (web search) arrive as several text blocks of one sentence: join without spaces
+                text = "".join(b.text for b in message.content if b.type == "text").strip()
                 if text:
                     said.append(text)
                     send_text(text)
@@ -258,16 +437,19 @@ class ClaudeChat:
             return "API error %s: %s" % (e.status_code, e.message)
         except self.anthropic.APIConnectionError as e:
             return "no connection to the API: %s (%r)" % (type(e).__name__, e.__cause__ or e)
-        if last is None or (not said and not drawn):
+        if last is None or (not said and not drawn and not sent_images):
             return "empty reply (stop_reason %s)" % (last.stop_reason if last else None)
         # only plain text goes into the history (no thinking or tool blocks), so trimming old turns is safe
         summary = " ".join(said)
         if drawn:
             summary = (summary + " " if summary else "") + "[I sent %d drawing(s).]" % len(drawn)
+        for src in sent_images:
+            summary = (summary + " " if summary else "") + "[I sent an image from %s.]" % src
         self.messages += [user, {"role": "assistant", "content": summary}]
         if len(self.messages) > 2 * self.keep:
             self.messages = self.messages[-2 * self.keep:]
-        return "ok, %d drawing(s), %d in / %d out tokens" % (len(drawn), usage_in, usage_out)
+        return "ok, %d drawing(s), %d image(s), %d in / %d out tokens" % (len(drawn), len(sent_images), usage_in,
+                                                                           usage_out)
 
 
 DEMO_SHAPES = [  # used by --dry-run: a sun, a house and a caption
@@ -311,9 +493,25 @@ def main():
                                        "--model, e.g. claude-o55 for claude-opus-5-5)")
     ap.add_argument("--keep-name", action="store_true", help="do not rename the host")
     ap.add_argument("--dry-run", action="store_true", help="no API calls: reply with a fixed text")
+    ap.add_argument("--no-web", action="store_true", help="no web search, web fetch or image downloads")
+    ap.add_argument("--send-image", metavar="URL", help="TEST: download, dither and post this image (or page's "
+                                                        "main image) to the room, then exit; no API calls")
+    ap.add_argument("--colour", action="store_true", help="with --send-image: 16-colour instead of black and white")
     a = ap.parse_args()
 
-    chat = None if a.dry_run else ClaudeChat(a.model, a.effort, a.history, not a.no_fallbacks)
+    if a.send_image:
+        try:
+            data, src = download_image(a.send_image)
+            rows = image_rows(data, colour=a.colour)
+        except FetchError as e:
+            sys.exit("send-image failed: %s" % e)
+        s = socket.create_connection((a.host, a.port), timeout=3)
+        s.sendall((json.dumps({"cmd": "chat", "pixels": rows}) + "\n").encode())
+        s.close()
+        print("sent image from %s (%d bytes downloaded)" % (src, len(data)))
+        return
+
+    chat = None if a.dry_run else ClaudeChat(a.model, a.effort, a.history, not a.no_fallbacks, not a.no_web)
     if chat:
         if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
             print("note: ANTHROPIC_API_KEY is not set in this terminal")
