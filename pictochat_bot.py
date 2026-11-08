@@ -660,29 +660,38 @@ def main():
 
     ident = {"name": (a.bot_name or bot_name(a.model))[:10], "model": a.model}
 
-    def worker():
-        while True:
-            job = work.get()
-            if job[0] == "greet":
-                _, event, names = job
-                if a.dry_run:
-                    send_text("Hi %s! I'm %s, happy to chat." % (name_list(names) or "everyone", ident["name"]))
-                    info = "dry run"
-                else:
-                    info = chat.greet(event, send_text)
-                log("greeting (%s) -> %s" % (name_list(names) or "everyone", info))
-                continue
-            msg = job[1]
-            who = sender_of(msg)
-            who_name = room.names.get(who)
-            label = "%s (%s)" % (who_name, who) if who_name else who
+    def handle_job(job):
+        if job[0] == "greet":
+            _, event, names = job
             if a.dry_run:
-                send_text("I got your picture (%d bytes). Bot is in dry-run mode; here is a test drawing." % len(msg))
-                send_picture(render_shapes(DEMO_SHAPES))
+                send_text("Hi %s! I'm %s, happy to chat." % (name_list(names) or "everyone", ident["name"]))
                 info = "dry run"
             else:
-                info = chat.ask(message_png(msg), label, send_text, send_picture)
-            log("message from %s -> %s" % (label, info))
+                info = chat.greet(event, send_text)
+            log("greeting (%s) -> %s" % (name_list(names) or "everyone", info))
+            return
+        msg = job[1]
+        who = sender_of(msg)
+        who_name = room.names.get(who)
+        label = "%s (%s)" % (who_name, who) if who_name else who
+        if a.dry_run:
+            send_text("I got your picture (%d bytes). Bot is in dry-run mode; here is a test drawing." % len(msg))
+            send_picture(render_shapes(DEMO_SHAPES))
+            info = "dry run"
+        else:
+            info = chat.ask(message_png(msg), label, send_text, send_picture)
+        log("message from %s -> %s" % (label, info))
+
+    def worker():
+        # one failed job (API error, broken picture, missing library) must not stop the bot: the process would
+        # keep running with a dead worker, so a service manager would never restart it
+        while True:
+            job = work.get()
+            try:
+                handle_job(job)
+            except Exception:  # noqa: BLE001
+                import traceback
+                log("job %s failed:\n%s" % (job[0], traceback.format_exc().rstrip()))
 
     def command(line):
         """Terminal commands: /model [name], /effort [level], /help."""
