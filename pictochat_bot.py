@@ -76,8 +76,9 @@ shapes, a few colours) - the canvas is tiny. You can add a short text message be
 
 A message that starts with a slash is a command for you as the bot: /debug (switch the small line with time and
 tokens after each reply on or off; "/debug on" or "/debug off" to set it), /model NAME (switch the model: haiku,
-sonnet, opus, fable), /effort LEVEL, /help (list the commands). Call run_command with the command exactly as
-written, then confirm the result in a few words in a small style (e.g. "[mono small] Debug mode on."). If you are
+sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /help (list the commands). Call
+run_command with the command exactly as written, then confirm the result in a few words in a small style (e.g.
+"[mono small] Debug mode on."). For /host and /help, show what the command returned, compactly, in [mono small]. If you are
 not sure a slash message is meant as a command, just chat.
 
 When someone asks for a QR code (or a link that is hard to copy by hand), use send_qr_code: it sends a real,
@@ -487,6 +488,53 @@ def render_shapes(shapes):
     return rows
 
 
+def host_status(state=None):
+    """One-paragraph status of the machine the bot runs on (a Raspberry Pi here): disk, memory, temperature, load,
+    uptime, Wi-Fi, undervoltage, plus the room from the host's last 'state' event. Linux only; missing parts are
+    left out."""
+    import shutil
+    import subprocess
+    parts = []
+    try:
+        du = shutil.disk_usage("/")
+        parts.append("disk %.1f GB free of %.1f GB" % (du.free / 1e9, du.total / 1e9))
+    except OSError:
+        pass
+    try:
+        mem = dict(ln.split(":", 1) for ln in open("/proc/meminfo"))
+        kb = lambda k: int(mem[k].split()[0])
+        parts.append("RAM %d MB free of %d MB" % (kb("MemAvailable") // 1024, kb("MemTotal") // 1024))
+    except (OSError, KeyError, ValueError):
+        pass
+    try:
+        parts.append("CPU %.1f C" % (int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000))
+    except (OSError, ValueError):
+        pass
+    try:
+        load = open("/proc/loadavg").read().split()[:3]
+        up = float(open("/proc/uptime").read().split()[0])
+        parts.append("load %s, up %dh%02dm" % (" ".join(load), up // 3600, up % 3600 // 60))
+    except (OSError, ValueError):
+        pass
+    try:
+        for ln in open("/proc/net/wireless").read().splitlines()[2:]:
+            f = ln.split()
+            parts.append("Wi-Fi %s signal %s dBm" % (f[0].rstrip(":"), f[3].rstrip(".")))
+    except (OSError, IndexError):
+        pass
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=3).stdout
+        val = int(out.strip().split("=")[1], 16)
+        parts.append("power ok" if val == 0 else "power WARNING throttled=0x%x (%s)" % (
+            val, "undervoltage now" if val & 1 else "undervoltage since boot" if val & 0x10000 else "throttling"))
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        pass
+    if state:
+        parts.append("room: %d DS(es), %s polls, %s replies, %s beacons" % (
+            len(state.get("aids") or {}), state.get("cmd", "?"), state.get("replies", "?"), state.get("beacons", "?")))
+    return "; ".join(parts) or "no status available"
+
+
 CONTROL_SOCKET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.sock")
 QR_QUIET = 2   # modules of blank paper around the code (the standard asks for 4; the bubble adds more on the sides)
 
@@ -675,8 +723,8 @@ class ClaudeChat:
 
         @beta_tool(name="run_command", input_schema=COMMAND_SCHEMA,
                    description="Run a bot command that someone sent in the room: a message that starts with a slash, "
-                               "such as /debug, /debug off, /model haiku, /help. Returns the bot's answer; confirm it "
-                               "in a few words.")
+                               "such as /debug, /debug off, /model haiku, /host, /help. Returns the bot's answer; "
+                               "confirm it in a few words (for /host and /help show the returned information).")
         def run_command_tool(command):
             if run_command is None:
                 return "Commands are not available here."
@@ -788,6 +836,7 @@ class Room:
         self.names = {}          # mac -> nickname (also of DSes that left; the replay contains old joins)
         self.present = None      # set of macs from the latest state event; None until the first one arrives
         self.greeted = {}        # mac -> time of the last personal welcome
+        self.state = None        # the host's latest 'state' event (polls, replies, beacons, AIDs)
 
     def on_member(self, msg):
         info = member_info(msg)
@@ -797,6 +846,7 @@ class Room:
 
     def on_state(self, ev):
         self.present = set((ev.get("aids") or {}).keys())
+        self.state = ev
 
     def on_log(self, text):
         """Handles the host's '# station <mac> deauthenticated ...' line; returns the MAC of a DS that left, or None."""
@@ -1056,7 +1106,7 @@ def main():
 
     def command(line):
         """Bot commands, typed in the terminal or sent from a DS (Claude passes them on through run_command):
-        /model [name], /effort [level], /debug [on|off], /help. Logs and returns the answer as text."""
+        /model [name], /effort [level], /debug [on|off], /host, /help. Logs and returns the answer as text."""
         out = []
 
         def log(text):
@@ -1101,9 +1151,11 @@ def main():
         elif cmd == "/debug":
             a.debug = {"on": True, "off": False}.get(arg, not a.debug) if arg in ("on", "off", "") else a.debug
             log("debug lines in the room: %s" % ("on" if a.debug else "off"))
+        elif cmd == "/host":
+            log("host: " + host_status(room.state))
         elif cmd in ("/help", "/?"):
             log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], "
-                "/debug [on|off], /help")
+                "/debug [on|off], /host (status of the machine: disk, memory, temperature, Wi-Fi, room), /help")
         else:
             log("unknown command %r (try /help)" % cmd)
         return "; ".join(out)
