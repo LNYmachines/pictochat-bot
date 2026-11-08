@@ -584,7 +584,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7777, help="the host's --gui-port")
-    ap.add_argument("--model", default="claude-haiku-5-5", help="model id, or an alias: haiku (default), sonnet, opus, fable; change it while running with /model")
+    ap.add_argument("--model", default="claude-sonnet-5-5", help="model id, or an alias: haiku, sonnet (default), opus, fable; change it while running with /model")
     ap.add_argument("--effort", default="low", choices=["low", "medium", "high", "xhigh", "max"],
                     help="reasoning effort per reply (low keeps chat replies quick)")
     ap.add_argument("--history", type=int, default=10, help="how many earlier exchanges Claude sees")
