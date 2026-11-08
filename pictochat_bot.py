@@ -487,6 +487,7 @@ def render_shapes(shapes):
     return rows
 
 
+CONTROL_SOCKET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.sock")
 QR_QUIET = 2   # modules of blank paper around the code (the standard asks for 4; the bubble adds more on the sides)
 
 
@@ -857,6 +858,11 @@ def main():
     ap.add_argument("--no-greet", action="store_true", help="do not say hi on entering or welcome DSes that join")
     ap.add_argument("--debug", action="store_true", help="after each reply, post a small line with the time it took, "
                                                          "the tokens and the model (toggle with /debug)")
+    ap.add_argument("--control", metavar="PATH", default=CONTROL_SOCKET,
+                    help="Unix socket on which the running bot takes commands (default: bot.sock next to this script)")
+    ap.add_argument("--cmd", metavar="COMMAND", help="send a command such as '/debug on' to the running bot (through "
+                                                     "--control) and print its answer, then exit; for a bot that runs "
+                                                     "as a service without a terminal")
     ap.add_argument("--send-image", metavar="URL", help="TEST: download, dither and post this image (or page's "
                                                         "main image) to the room, then exit; no API calls")
     ap.add_argument("--colour", action="store_true", help="with --send-image: 16-colour instead of black and white")
@@ -864,6 +870,22 @@ def main():
                                                       "calls")
     ap.add_argument("--qr-png", metavar="FILE", help="with --send-qr: only write a preview PNG, do not connect")
     a = ap.parse_args()
+    if a.cmd:
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(30)                  # /model checks the new model with the API first
+            c.connect(a.control)
+            c.sendall((a.cmd.strip() + "\n").encode())
+            reply = b""
+            while True:
+                d = c.recv(4096)
+                if not d:
+                    break
+                reply += d
+            print(reply.decode("utf-8", "replace").strip() or "(no answer)")
+        except OSError as e:
+            sys.exit("no running bot on %s (%s)" % (a.control, e))
+        return
     if a.send_qr:
         try:
             rows, info = qr_rows(a.send_qr)
@@ -901,8 +923,11 @@ def main():
         print(("API check: " if ok else "API check FAILED: ") + info, flush=True)
     work = queue.Queue()
 
+    log_lock = threading.Lock()
+
     def log(s):
-        print(time.strftime("%H:%M:%S"), s, flush=True)
+        with log_lock:                        # several threads log (worker, receiver, control socket)
+            print(time.strftime("%H:%M:%S"), s, flush=True)
 
     def connect():
         while True:
@@ -1092,6 +1117,35 @@ def main():
 
     room = Room()
     threading.Thread(target=worker, daemon=True).start()
+    def control_server():
+        """Commands for a bot without a terminal (systemd): one line per connection, the answer goes back."""
+        try:
+            if os.path.exists(a.control):
+                os.unlink(a.control)
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            old = os.umask(0o177)                 # only this user may connect
+            try:
+                srv.bind(a.control)
+            finally:
+                os.umask(old)
+            srv.listen(2)
+        except OSError as e:
+            log("no control socket on %s: %s" % (a.control, e))
+            return
+        log("commands also through %s (pictochat_bot.py --cmd '/help')" % a.control)
+        while True:
+            c, _ = srv.accept()
+            try:
+                c.settimeout(5)
+                line = c.makefile("r", encoding="utf-8", errors="replace").readline().strip()
+                c.settimeout(None)
+                c.sendall(((command(line) if line else "") or "(no answer)").encode() + b"\n")
+            except Exception as e:  # noqa: BLE001 - a bad client must not stop the server
+                log("control command failed: %s" % e)
+            finally:
+                c.close()
+
+    threading.Thread(target=control_server, daemon=True).start()
     if sys.stdin:
         threading.Thread(target=stdin_reader, daemon=True).start()
         log("model %s; type /model to see or change it, /help for all commands" % a.model)
