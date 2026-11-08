@@ -688,16 +688,24 @@ class ClaudeChat:
             return run_command(text) or "done"
 
         tools = [draw_picture, send_qr_code, run_command_tool] + ([send_image] + web_tools(self.model) if self.web else [])
-        kwargs = dict(model=self.model, max_tokens=4096, system=SYSTEM + (SYSTEM_WEB if self.web else ""),
+        # Prompt caching: the tool definitions and the system prompt (about 8000 tokens, two thirds of them the web
+        # tools) are the same in every request; the marker on the system block caches them together (tools render
+        # first), and the top-level cache_control caches the growing conversation. Cached input costs 0.1x.
+        system = [{"type": "text", "text": SYSTEM + (SYSTEM_WEB if self.web else ""),
+                   "cache_control": {"type": "ephemeral"}}]
+        kwargs = dict(model=self.model, max_tokens=4096, system=system, cache_control={"type": "ephemeral"},
                       messages=self.messages + [user], tools=tools, output_config={"effort": self.effort},
                       max_iterations=8)
         kwargs.update(self._extra())    # on a safety decline the API retries on a fallback model (where it exists)
-        said, usage_in, usage_out, last = [], 0, 0, None
+        said, usage_in, usage_out, usage_cached, last = [], 0, 0, 0, None
         try:
             for message in self.client.beta.messages.tool_runner(**kwargs):
                 last = message
-                usage_in += message.usage.input_tokens
-                usage_out += message.usage.output_tokens
+                u = message.usage
+                cached = u.cache_read_input_tokens or 0
+                usage_in += u.input_tokens + cached + (u.cache_creation_input_tokens or 0)
+                usage_cached += cached
+                usage_out += u.output_tokens
                 if message.stop_reason == "refusal":
                     send_text("Sorry, I can't answer that one.")
                     return "refused (%s)" % getattr(message.stop_details, "category", None)
@@ -730,8 +738,8 @@ class ClaudeChat:
         self.messages += [user, {"role": "assistant", "content": summary}]
         if len(self.messages) > 2 * self.keep:
             self.messages = self.messages[-2 * self.keep:]
-        return "ok, %d drawing(s), %d image(s), %d QR code(s), %d in / %d out tokens" % (
-            len(drawn), len(sent_images), len(sent_qr), usage_in, usage_out)
+        return "ok, %d drawing(s), %d image(s), %d QR code(s), %d in / %d out tokens (%d of the input from cache)" % (
+            len(drawn), len(sent_images), len(sent_qr), usage_in, usage_out, usage_cached)
 
     def greet(self, event, send_text):
         """Say hello for a room event (a plain-text note such as 'You just entered the room. In the room: Ann, Bo.').
@@ -936,11 +944,11 @@ def main():
     def after_request(info, started):
         """Debug line and error notices after an API request (info: the status string from ask/greet)."""
         took = time.time() - started
-        m = re.search(r"(\d+) in / (\d+) out tokens", info or "")
+        m = re.search(r"(\d+) in / (\d+) out tokens(?: \((\d+) of the input from cache\))?", info or "")
         if a.debug and not a.dry_run:
             if m:
-                send_text("[mono small blue] %.1f s, %s in / %s out tokens, %s" % (took, m.group(1), m.group(2),
-                                                                                chat.model))
+                send_text("[mono small blue] %.1f s, %s in%s / %s out tokens, %s" % (
+                    took, m.group(1), " (%s cached)" % m.group(3) if m.group(3) else "", m.group(2), chat.model))
             else:
                 send_text("[mono small blue] %.1f s, %s" % (took, (info or "")[:60]))
         kind = None
