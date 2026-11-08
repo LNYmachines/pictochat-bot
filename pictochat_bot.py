@@ -80,6 +80,25 @@ class ClaudeChat:
         self.model, self.effort, self.keep, self.fallbacks = model, effort, history, fallbacks
         self.messages = []      # alternating user (picture) / assistant (text); assistant turns are plain text
 
+    def check(self):
+        """Free start-up check (a model lookup, no tokens billed): key, network and model access."""
+        a = self.anthropic
+        try:
+            m = self.client.models.retrieve(self.model)
+            return True, "API reachable, key accepted, model %s available" % m.id
+        except a.AuthenticationError:
+            return False, "the API rejected the key: is ANTHROPIC_API_KEY set in this terminal and complete?"
+        except a.NotFoundError:
+            return False, "model %s is not available to this key (try --model claude-sonnet-5-5)" % self.model
+        except a.APIStatusError as e:
+            return False, "API error %s: %s" % (e.status_code, e.message)
+        except a.APIConnectionError as e:
+            proxy = [k for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+                     if os.environ.get(k)]
+            return False, ("cannot reach api.anthropic.com: %s (%r)%s. Run with ANTHROPIC_LOG=debug for details."
+                           % (type(e).__name__, e.__cause__ or e,
+                              "; proxy variables set: " + ", ".join(proxy) if proxy else ""))
+
     def ask(self, png, sender):
         user = {"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png",
@@ -101,8 +120,8 @@ class ClaudeChat:
             return None, "rate limited, try again in a moment"
         except self.anthropic.APIStatusError as e:
             return None, "API error %s: %s" % (e.status_code, e.message)
-        except self.anthropic.APIConnectionError:
-            return None, "no connection to the API"
+        except self.anthropic.APIConnectionError as e:
+            return None, "no connection to the API: %s (%r)" % (type(e).__name__, e.__cause__ or e)
         if resp.stop_reason == "refusal":
             return "Sorry, I can't answer that one.", "refused (%s)" % getattr(resp.stop_details, "category", None)
         text = " ".join(b.text for b in resp.content if b.type == "text").strip()
@@ -135,6 +154,11 @@ def main():
     a = ap.parse_args()
 
     chat = None if a.dry_run else ClaudeChat(a.model, a.effort, a.history, not a.no_fallbacks)
+    if chat:
+        if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+            print("note: ANTHROPIC_API_KEY is not set in this terminal")
+        ok, info = chat.check()
+        print(("API check: " if ok else "API check FAILED: ") + info, flush=True)
     work = queue.Queue()
 
     def log(s):
