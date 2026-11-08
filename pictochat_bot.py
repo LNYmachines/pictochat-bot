@@ -813,6 +813,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="no API calls: reply with a fixed text")
     ap.add_argument("--no-web", action="store_true", help="no web search, web fetch or image downloads")
     ap.add_argument("--no-greet", action="store_true", help="do not say hi on entering or welcome DSes that join")
+    ap.add_argument("--debug", action="store_true", help="after each reply, post a small line with the time it took, "
+                                                         "the tokens and the model (toggle with /debug)")
     ap.add_argument("--send-image", metavar="URL", help="TEST: download, dither and post this image (or page's "
                                                         "main image) to the room, then exit; no API calls")
     ap.add_argument("--colour", action="store_true", help="with --send-image: 16-colour instead of black and white")
@@ -895,15 +897,44 @@ def main():
 
     ident = {"name": (a.bot_name or bot_name(a.model))[:10], "model": a.model}
 
+    notified = {}   # error kind -> time the room was last told about it
+
+    def after_request(info, started):
+        """Debug line and error notices after an API request (info: the status string from ask/greet)."""
+        took = time.time() - started
+        m = re.search(r"(\d+) in / (\d+) out tokens", info or "")
+        if a.debug and not a.dry_run:
+            if m:
+                send_text("[mono small blue] %.1f s, %s in / %s out tokens, %s" % (took, m.group(1), m.group(2),
+                                                                                chat.model))
+            else:
+                send_text("[mono small blue] %.1f s, %s" % (took, (info or "")[:60]))
+        kind = None
+        if info and "credit balance" in info:
+            kind, text = "credit", "Sorry, I can't answer right now: the bot's API credit is used up."
+        elif info and info.startswith("no valid API key"):
+            kind, text = "key", "Sorry, I can't answer right now: the bot's API key is not accepted."
+        elif info and info.startswith("rate limited"):
+            kind, text = "rate", "Too many messages at once, give me a moment."
+        elif info and info.startswith("no connection"):
+            kind, text = "net", "Sorry, I can't reach the internet right now."
+        elif info and info.startswith("API error"):
+            kind, text = "api", "Sorry, something went wrong on my side. Try again in a bit."
+        if kind and time.time() - notified.get(kind, 0) > 600:
+            notified[kind] = time.time()
+            send_text("[italic normal] " + text)
+
     def handle_job(job):
         if job[0] == "greet":
             _, event, names = job
+            started = time.time()
             if a.dry_run:
                 send_text("Hi %s! I'm %s, happy to chat." % (name_list(names) or "everyone", ident["name"]))
                 info = "dry run"
             else:
                 info = chat.greet(event, send_text)
             log("greeting (%s) -> %s" % (name_list(names) or "everyone", info))
+            after_request(info, started)
             return
         msgs = job[1]
         labels = []
@@ -911,6 +942,7 @@ def main():
             who = sender_of(msg)
             who_name = room.names.get(who)
             labels.append("%s (%s)" % (who_name, who) if who_name else who)
+        started = time.time()
         if a.dry_run:
             send_text("I got %d picture(s). Bot is in dry-run mode; here is a test drawing." % len(msgs))
             send_picture(render_shapes(DEMO_SHAPES))
@@ -919,6 +951,7 @@ def main():
             info = chat.ask([(message_png(m), l) for m, l in zip(msgs, labels)], send_text, send_picture)
         log("%s from %s -> %s" % ("message" if len(msgs) == 1 else "%d messages" % len(msgs),
                                   ", ".join(dict.fromkeys(labels)), info))
+        after_request(info, started)
 
     later = []
 
@@ -952,7 +985,7 @@ def main():
                 log("job %s failed:\n%s" % (job[0], traceback.format_exc().rstrip()))
 
     def command(line):
-        """Terminal commands: /model [name], /effort [level], /help."""
+        """Terminal commands: /model [name], /effort [level], /debug [on|off], /help."""
         parts = line.split()
         if not parts:
             return
@@ -988,8 +1021,12 @@ def main():
                 log("effort: %s" % arg)
             else:
                 log("effort: %s (choose one of %s)" % (a.effort, ", ".join(levels)))
+        elif cmd == "/debug":
+            a.debug = {"on": True, "off": False}.get(arg, not a.debug) if arg in ("on", "off", "") else a.debug
+            log("debug lines in the room: %s" % ("on" if a.debug else "off"))
         elif cmd in ("/help", "/?"):
-            log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], /help")
+            log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], "
+                "/debug [on|off], /help")
         else:
             log("unknown command %r (try /help)" % cmd)
 
