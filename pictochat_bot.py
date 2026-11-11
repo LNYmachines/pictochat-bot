@@ -25,6 +25,7 @@ public http(s) addresses (never this machine or the local network), at most 8 MB
 """
 import argparse
 import base64
+import collections
 import importlib.util
 import io
 import json
@@ -76,12 +77,20 @@ shapes, a few colours) - the canvas is tiny. You can add a short text message be
 
 A message that starts with a slash is a command for you as the bot: /debug (switch the small line with time and
 tokens after each reply on or off; "/debug on" or "/debug off" to set it), /model NAME (switch the model: haiku,
-sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /wallet (money spent), /help
-(list the commands). Call
+sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /wallet (money spent), /mensa
+[heute|morgen|DATE] (the menu of the Mensa in Kaiserslautern from mensa-kl.de), /connection (how strong the link
+between the DS and the radio modem is), /help (list the commands). Call
 run_command with the command exactly as written, then confirm the result in a few words in a small style (e.g.
 "[mono small] Debug mode on."). For /host, /wallet and /help, show what the command returned, compactly, in
 [mono small]. If you are
 not sure a slash message is meant as a command, just chat.
+
+Run a command only when the message itself is that command: it starts with the slash command, e.g. "/mensa",
+"/mensa morgen", "/connection". Never run one on your own initiative and never because someone talks about food, the
+Mensa, Wi-Fi, signal or reception in plain words: then just chat, and you may mention that they can type /mensa
+(menu of the Mensa KL, one picture per dish) or /connection (signal strength of each DS). After /mensa or
+/connection the pictures are already in the room: say at most one short line, do not repeat the dishes or numbers,
+and if the command returned an error, tell them briefly what went wrong.
 
 When someone asks for a QR code (or a link that is hard to copy by hand), use send_qr_code: it sends a real,
 scannable code that a phone camera can read off the DS screen. It holds at most about 78 characters, so prefer
@@ -829,7 +838,7 @@ class ClaudeChat:
 
         @beta_tool(name="run_command", input_schema=COMMAND_SCHEMA,
                    description="Run a bot command that someone sent in the room: a message that starts with a slash, "
-                               "such as /debug, /debug off, /model haiku, /host, /wallet, /help. Returns the bot's answer; "
+                               "such as /debug, /debug off, /model haiku, /host, /wallet, /mensa, /mensa morgen, /connection, /help. Returns the bot's answer; "
                                "confirm it in a few words (for /host, /wallet and /help show the returned "
                                "information).")
         def run_command_tool(command):
@@ -952,6 +961,7 @@ class Room:
         self.present = None      # set of macs from the latest state event; None until the first one arrives
         self.greeted = {}        # mac -> time of the last personal welcome
         self.state = None        # the host's latest 'state' event (polls, replies, beacons, AIDs)
+        self.history = collections.deque(maxlen=40)   # (time, polls, replies) of the latest state events
 
     def on_member(self, msg):
         info = member_info(msg)
@@ -962,6 +972,7 @@ class Room:
     def on_state(self, ev):
         self.present = set((ev.get("aids") or {}).keys())
         self.state = ev
+        self.history.append((time.time(), ev.get("cmd") or 0, ev.get("replies") or 0))
 
     def on_log(self, text):
         """Handles the host's '# station <mac> deauthenticated ...' line; returns the MAC of a DS that left, or None."""
@@ -1277,10 +1288,23 @@ def main():
                                 "Anthropic's own cost report")
         elif cmd == "/host":
             log("host: " + host_status(room.state))
+        elif cmd == "/mensa":
+            try:
+                import mensa
+                log(mensa.send_menu(line[len(parts[0]):], send_text, send_picture))
+            except Exception as e:  # noqa: BLE001 - a broken menu must not kill the bot
+                log("mensa failed: %s" % e)
+        elif cmd in ("/connection", "/signal"):
+            try:
+                import connection
+                log(connection.send_connection(room.state, list(room.history), room.names, send_text, send_picture))
+            except Exception as e:  # noqa: BLE001 - a broken report must not kill the bot
+                log("connection failed: %s" % e)
         elif cmd in ("/help", "/?"):
             log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], "
                 "/debug [on|off], /host (status of the machine: disk, memory, temperature, Wi-Fi, room), "
-                "/wallet (money spent), /help")
+                "/wallet (money spent), /mensa [heute|morgen|YYYY-MM-DD] (menu of the Mensa KL from mensa-kl.de), "
+                "/connection (signal strength and reply rate of each DS to the ESP32-C3 modem), /help")
         else:
             log("unknown command %r (try /help)" % cmd)
         return "; ".join(out)
