@@ -38,6 +38,7 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+__version__ = "0.2.0"
 def _find_host_file(name):
     """pictochat_gui.py comes from the PictoChat host repo: next to this file, in $PICTOCHAT_HOST, or ../pictochat_host."""
     for d in (HERE, os.environ.get("PICTOCHAT_HOST", ""), os.path.join(HERE, "..", "pictochat_host")):
@@ -85,11 +86,12 @@ shapes, a few colours) - the canvas is tiny. You can add a short text message be
 
 A message that starts with a slash is a command for you as the bot: /debug (switch the small line with time and
 tokens after each reply on or off; "/debug on" or "/debug off" to set it), /model NAME (switch the model: haiku,
-sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /wallet (money spent), /mensa
+sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /server (version of the PictoChat
+host that runs this room, and your own version), /wallet (money spent), /mensa
 [heute|morgen|DATE] (the menu of the Mensa in Kaiserslautern from mensa-kl.de), /connection (how strong the link
 between the DS and the radio modem is), /help (list the commands). Call
 run_command with the command exactly as written, then confirm the result in a few words in a small style (e.g.
-"[mono small] Debug mode on."). For /host, /wallet and /help, show what the command returned, compactly, in
+"[mono small] Debug mode on."). For /host, /server, /wallet and /help, show what the command returned, compactly, in
 [mono small]. If you are
 not sure a slash message is meant as a command, just chat.
 
@@ -507,6 +509,49 @@ def render_shapes(shapes):
     return rows
 
 
+def bot_commit():
+    """Short git commit of this bot: from its checkout, or from pictochat_bot.commit next to it ('' if unknown)."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "-C", HERE, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=3)
+        top = subprocess.run(["git", "-C", HERE, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                             timeout=3).stdout.strip()
+        if r.returncode == 0 and top and os.path.realpath(top) == os.path.realpath(HERE):
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open(os.path.join(HERE, "pictochat_bot.commit")) as fh:
+            return fh.read().split()[0][:12]
+    except (OSError, IndexError):
+        return ""
+
+
+def _ago(seconds):
+    s = int(seconds)
+    return "%d d %d h" % (s // 86400, s % 86400 // 3600) if s >= 86400 else \
+           "%d h %02d min" % (s // 3600, s % 3600 // 60) if s >= 3600 else "%d min" % (s // 60)
+
+
+def server_status(state=None):
+    """/server: which PictoChat host (the room's server) is running, from its last 'state' event, and this bot's
+    own version."""
+    c = bot_commit()
+    bot = "bot %s%s" % (__version__, " (commit %s)" % c if c else "")
+    if not state:
+        return "no status from the host yet (it sends one every 5 s); " + bot
+    if not state.get("version"):
+        return "the host is older than 0.2.0 and does not report its version; " + bot
+    parts = ["PictoChat host %s%s" % (state["version"], " (commit %s)" % state["commit"] if state.get("commit") else ""),
+             "%s host" % {"python": "Python", "rust": "Rust"}.get(state.get("impl"), state.get("impl") or "unknown")]
+    if state.get("radio"):
+        parts.append("radio: %s" % state["radio"])
+    if state.get("uptime") is not None:
+        parts.append("running for %s" % _ago(state["uptime"]))
+    parts.append("%d DS(es) in the room" % len(state.get("aids") or {}))
+    return ", ".join(parts) + "; " + bot
+
+
 def host_status(state=None):
     """One-paragraph status of the machine the bot runs on (a Raspberry Pi here): disk, memory, temperature, load,
     uptime, Wi-Fi, undervoltage, plus the room from the host's last 'state' event. Linux only; missing parts are
@@ -846,8 +891,8 @@ class ClaudeChat:
 
         @beta_tool(name="run_command", input_schema=COMMAND_SCHEMA,
                    description="Run a bot command that someone sent in the room: a message that starts with a slash, "
-                               "such as /debug, /debug off, /model haiku, /host, /wallet, /mensa, /mensa morgen, /connection, /help. Returns the bot's answer; "
-                               "confirm it in a few words (for /host, /wallet and /help show the returned "
+                               "such as /debug, /debug off, /model haiku, /host, /server, /wallet, /mensa, /mensa morgen, /connection, /help. Returns the bot's answer; "
+                               "confirm it in a few words (for /host, /server, /wallet and /help show the returned "
                                "information).")
         def run_command_tool(command):
             if run_command is None:
@@ -1243,7 +1288,7 @@ def main():
 
     def command(line):
         """Bot commands, typed in the terminal or sent from a DS (Claude passes them on through run_command):
-        /model [name], /effort [level], /debug [on|off], /host, /wallet, /help. Logs and returns the answer."""
+        /model [name], /effort [level], /debug [on|off], /host, /server, /wallet, /help. Logs and returns the answer."""
         out = []
 
         def log(text):
@@ -1296,6 +1341,8 @@ def main():
                                 "Anthropic's own cost report")
         elif cmd == "/host":
             log("host: " + host_status(room.state))
+        elif cmd in ("/server", "/version"):
+            log("server: " + server_status(room.state))
         elif cmd == "/mensa":
             try:
                 import mensa
@@ -1311,6 +1358,7 @@ def main():
         elif cmd in ("/help", "/?"):
             log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], "
                 "/debug [on|off], /host (status of the machine: disk, memory, temperature, Wi-Fi, room), "
+                "/server (version of the PictoChat host that runs the room, and of this bot), "
                 "/wallet (money spent), /mensa [heute|morgen|YYYY-MM-DD] (menu of the Mensa KL from mensa-kl.de), "
                 "/connection (signal strength and reply rate of each DS to the ESP32-C3 modem), /help")
         else:

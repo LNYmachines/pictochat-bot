@@ -74,6 +74,9 @@ sudo python3 ../pictochat_host/pictochat.py host --iface <wifi-interface> --chan
   so its cached prefix stays reusable.
 - **`/host`:** status of the machine the bot runs on (disk, RAM, CPU temperature, load, uptime, Wi-Fi signal,
   `vcgencmd get_throttled`, and the room from the host's last `state` event); from a DS Claude shows it compactly.
+- **`/server`** (alias `/version`): the version and git commit of the PictoChat host that runs the room, whether it
+  is the Python or the Rust host, its radio, how long it has been running, and this bot's own version. It needs a
+  host of version 0.2.0 or newer.
 - **`/mensa [heute|morgen|YYYY-MM-DD]`** (`mensa.py`): the menu of the Mensa Kaiserslautern from the mensa-kl.de
   JSON API, one picture per meal (counter and price in a coloured header, food photo, dish name), source credited in
   the last message. `python3 mensa.py preview OUTDIR [ARG]` renders the pictures without sending.
