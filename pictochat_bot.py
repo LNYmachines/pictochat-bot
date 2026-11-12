@@ -87,7 +87,8 @@ shapes, a few colours) - the canvas is tiny. You can add a short text message be
 A message that starts with a slash is a command for you as the bot: /debug (switch the small line with time and
 tokens after each reply on or off; "/debug on" or "/debug off" to set it), /model NAME (switch the model: haiku,
 sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /server (version of the PictoChat
-host that runs this room, and your own version), /wallet (money spent), /mensa
+host that runs this room, and your own version), /about (a title picture of this project with the versions),
+/wallet (money spent), /mensa
 [heute|morgen|DATE] (the menu of the Mensa in Kaiserslautern from mensa-kl.de), /connection (how strong the link
 between the DS and the radio modem is), /help (list the commands). Call
 run_command with the command exactly as written, then confirm the result in a few words in a small style (e.g.
@@ -98,7 +99,7 @@ not sure a slash message is meant as a command, just chat.
 Run a command only when the message itself is that command: it starts with the slash command, e.g. "/mensa",
 "/mensa morgen", "/connection". Never run one on your own initiative and never because someone talks about food, the
 Mensa, Wi-Fi, signal or reception in plain words: then just chat, and you may mention that they can type /mensa
-(menu of the Mensa KL, one picture per dish) or /connection (signal strength of each DS). After /mensa or
+(menu of the Mensa KL, one picture per dish) or /connection (signal strength of each DS). After /mensa, /about or
 /connection the pictures are already in the room: say at most one short line, do not repeat the dishes or numbers,
 and if the command returned an error, tell them briefly what went wrong.
 
@@ -891,7 +892,7 @@ class ClaudeChat:
 
         @beta_tool(name="run_command", input_schema=COMMAND_SCHEMA,
                    description="Run a bot command that someone sent in the room: a message that starts with a slash, "
-                               "such as /debug, /debug off, /model haiku, /host, /server, /wallet, /mensa, /mensa morgen, /connection, /help. Returns the bot's answer; "
+                               "such as /debug, /debug off, /model haiku, /host, /server, /about, /wallet, /mensa, /mensa morgen, /connection, /help. Returns the bot's answer; "
                                "confirm it in a few words (for /host, /server, /wallet and /help show the returned "
                                "information).")
         def run_command_tool(command):
@@ -1349,6 +1350,12 @@ def main():
                 log(mensa.send_menu(line[len(parts[0]):], send_text, send_picture))
             except Exception as e:  # noqa: BLE001 - a broken menu must not kill the bot
                 log("mensa failed: %s" % e)
+        elif cmd == "/about":
+            try:
+                import about
+                log(about.send_about(room.state, __version__, bot_commit(), send_text, send_picture))
+            except Exception as e:  # noqa: BLE001 - a broken picture must not kill the bot
+                log("about failed: %s" % e)
         elif cmd in ("/connection", "/signal"):
             try:
                 import connection
@@ -1359,6 +1366,7 @@ def main():
             log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], "
                 "/debug [on|off], /host (status of the machine: disk, memory, temperature, Wi-Fi, room), "
                 "/server (version of the PictoChat host that runs the room, and of this bot), "
+                "/about (a title picture with the versions), "
                 "/wallet (money spent), /mensa [heute|morgen|YYYY-MM-DD] (menu of the Mensa KL from mensa-kl.de), "
                 "/connection (signal strength and reply rate of each DS to the ESP32-C3 modem), /help")
         else:

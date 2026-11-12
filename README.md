@@ -77,6 +77,8 @@ sudo python3 ../pictochat_host/pictochat.py host --iface <wifi-interface> --chan
 - **`/server`** (alias `/version`): the version and git commit of the PictoChat host that runs the room, whether it
   is the Python or the Rust host, its radio, how long it has been running, and this bot's own version. It needs a
   host of version 0.2.0 or newer.
+- **`/about`** (`about.py`): a title picture drawn in the DS's 16 colours (a handheld, radio waves, the versions of
+  host and bot). `python3 about.py preview OUTDIR` renders it without sending.
 - **`/mensa [heute|morgen|YYYY-MM-DD]`** (`mensa.py`): the menu of the Mensa Kaiserslautern from the mensa-kl.de
   JSON API, one picture per meal (counter and price in a coloured header, food photo, dish name), source credited in
   the last message. `python3 mensa.py preview OUTDIR [ARG]` renders the pictures without sending.
@@ -140,6 +142,7 @@ image code), and the piwheels Pillow needs `libopenjp2-7` and friends. `botctl` 
 | `pictochat_bot.py` | the bot |
 | `mensa.py` | `/mensa`: Mensa Kaiserslautern menu as pictures (`python3 mensa.py preview OUTDIR` renders without sending) |
 | `connection.py` | `/connection`: signal and reply rate per DS as pictures |
+| `about.py` | `/about`: title picture with the versions |
 | `screenshots/` | the bot on an emulated DS |
 
 ## License
