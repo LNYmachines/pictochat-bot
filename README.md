@@ -79,9 +79,13 @@ sudo python3 ../pictochat_host/pictochat.py host --iface <wifi-interface> --chan
   host of version 0.2.0 or newer.
 - **`/about`** (`about.py`): a title picture drawn in the DS's 16 colours (a handheld, radio waves, the versions of
   host and bot). `python3 about.py preview OUTDIR` renders it without sending.
-- **`/mensa [heute|morgen|YYYY-MM-DD]`** (`mensa.py`): the menu of the Mensa Kaiserslautern from the mensa-kl.de
-  JSON API, one picture per meal (counter and price in a coloured header, food photo, dish name), source credited in
-  the last message. `python3 mensa.py preview OUTDIR [ARG]` renders the pictures without sending.
+- **`/mensa [day]`** (`mensa.py`): the menu of the Mensa Kaiserslautern from the mensa-kl.de JSON API as an
+  overview: a few pictures with one line per dish (counter label in the counter's colour, a diet badge such as `V+`
+  for vegan, the name, the price). The last picture credits the source. `day` is `heute`, `morgen`, `übermorgen`,
+  `N Tage` or `YYYY-MM-DD`.
+- **`/mensa 1|2|atrium|grill|abend|alle [day]`**: one photo card per dish of that counter (or of all): the photo in
+  the DS's 16 colours, the full name, badges for diet and rating. `python3 mensa.py preview OUTDIR [ARG]` renders
+  the pictures without sending.
 - **`/connection`** (alias `/signal`, `connection.py`): one picture per DS with signal bars, the smoothed dBm and a
   rating, the share of polls it answered (last 60 s) and how long ago it was heard. The host adds this to its
   `state` event: `rssi` (MAC -> last dBm, smoothed dBm, seconds since heard, frame count), `reply_age` (seconds since

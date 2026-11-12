@@ -1,5 +1,6 @@
-"""mensa-kl.de menu for the PictoChat bot: /mensa sends one picture per meal (Ausgabe + price in a coloured header,
-the food photo on the left, the dish name on the right) into the room.
+"""mensa-kl.de menu for the PictoChat bot. /mensa sends an overview into the room: a few pictures with one line per
+dish (counter, diet badge, name, price). /mensa 1, /mensa atrium, /mensa grill ... send one photo card per dish of
+that counter (colour photo on the left, name on the right, badges for diet and rating); /mensa alle sends them all.
 
 Data: https://www.mensa-kl.de/api.php?format=json&date=N (the documented "legacy API"; data may be reused if the
 source mensa-kl.de is credited, which the last message of every menu does).
@@ -42,7 +43,7 @@ DIET_TAGS = [(23, "vegan"), (22, "vegetarisch")]                 # food label id
 ICONS = {"beef": "Rind", "pork": "Schwein", "poultry": "Geflügel", "fish": "Fisch", "game": "Wild", "lamb": "Lamm",
          "calf": "Kalb"}                                         # the site's own diet icon of a meal
 
-USAGE = "/mensa [heute|morgen|übermorgen|N Tage|JJJJ-MM-TT]"
+USAGE = "/mensa [1|2|atrium|grill|abend|alle] [heute|morgen|übermorgen|N Tage|JJJJ-MM-TT]"
 
 _menu_cache = {}                     # date argument -> (time, meals)
 _image_cache = {}                    # url -> bytes
@@ -73,17 +74,18 @@ def _get(url):
 def parse_arg(text):
     """The part after /mensa -> (API date argument, wording for the answer). Raises MensaError for bad input."""
     word = text.strip().lower()
+    # Dates are worked out here, on this machine's clock: the service's own "today" (date=0) still shows
+    # yesterday for a while after midnight.
+    ahead = lambda n: (datetime.date.today() + datetime.timedelta(days=n)).isoformat()
     if word in ("", "heute", "today"):
-        return "0"
+        return ahead(0)
     if word in ("morgen", "tomorrow"):
-        return "1"
+        return ahead(1)
     if word in ("übermorgen", "uebermorgen"):
-        return "2"
+        return ahead(2)
     parts = word.split()
     if len(parts) == 2 and parts[0].isdigit() and parts[1] in ("tage", "tag", "days", "day") and int(parts[0]) < 1000:
-        return str(int(parts[0]))
-    if word.isdigit() and int(word) < 1000:
-        return str(int(word))
+        return ahead(int(parts[0]))
     try:
         return datetime.date.fromisoformat(word).isoformat()
     except ValueError:
@@ -102,12 +104,13 @@ def fetch_meals(date_arg):
     except ValueError:
         raise MensaError("mensa-kl.de sent an unreadable answer") from None
     meals = [m for m in raw if isinstance(m, dict) and m.get("loc") not in NOT_FOOD and m.get("title")]
-    if not meals and date_arg == "0":
+    if not meals and date_arg == datetime.date.today().isoformat():
         try:
             future = json.loads(_get(API % "all").decode("utf-8"))
         except ValueError:
             future = []
-        future = [m for m in future if isinstance(m, dict) and m.get("loc") not in NOT_FOOD and m.get("title")]
+        future = [m for m in future if isinstance(m, dict) and m.get("loc") not in NOT_FOOD and m.get("title")
+                  and str(m.get("date", "")) >= date_arg]
         if future:
             first = min(m["date"] for m in future)
             meals = [m for m in future if m["date"] == first]
@@ -217,6 +220,10 @@ def _photo_rows(rows, data, box, colour):
     img = ImageOps.exif_transpose(img).convert("RGB")
     img = ImageOps.fit(img, (w, h), Image.LANCZOS, centering=(0.5, 0.5))
     if colour:
+        # stronger contrast and colour first: the palette has only white, grey, black and a saturated rainbow,
+        # so a flat photo would dither into confetti
+        from PIL import ImageEnhance
+        img = ImageEnhance.Color(ImageOps.autocontrast(img, cutoff=1)).enhance(1.7)
         pal = Image.new("P", (1, 1))
         flat = []
         for i in range(16):
@@ -236,63 +243,124 @@ def _photo_rows(rows, data, box, colour):
                 rows[y0 + y][x0 + x] = 1
 
 
-def meal_picture(meal, photo=None, colour=False):
-    """One 80 x 256 PictoChat picture for a meal: header (Ausgabe left, price right), photo on the left, name and
-    a line with diet and rating on the right. Without a photo the text uses the full width."""
+COUNTER_COLOUR = {"Ausgabe 1": 5, "Ausgabe 2": 13, "Atrium": 15, "Grill": 6, "Abend": 3}   # one colour per counter
+COUNTER_SHORT = {"Ausgabe 1": "A1", "Ausgabe 2": "A2", "Atrium": "Atr", "Grill": "Grill", "Abend": "Abend"}
+# diet badge: (text, short text, background colour, text colour)
+DIET_BADGE = {"vegan": ("vegan", "V+", 10, 1), "vegetarisch": ("vegetarisch", "V", 9, 1), "Fisch": ("Fisch", "Fi", 13, 0),
+              "Geflügel": ("Geflügel", "Gf", 7, 1), "Rind": ("Rind", "Ri", 6, 0), "Schwein": ("Schwein", "Sw", 4, 0),
+              "Wild": ("Wild", "Wi", 6, 0), "Lamm": ("Lamm", "La", 6, 0), "Kalb": ("Kalb", "Ka", 6, 0)}
+PER_PAGE = 4                         # dishes per overview picture
+
+
+def counter_colour(meal):
+    return COUNTER_COLOUR.get(ausgabe(meal), 1)
+
+
+def diet(meal):
+    tags = set(meal.get("tags") or [])
+    return next((name for tag, name in DIET_TAGS if tag in tags), "") or ICONS.get(str(meal.get("icon") or ""), "")
+
+
+def rating_text(meal):
+    if not meal.get("rating_amt"):
+        return ""
+    return "★ %s (%s)" % (("%.1f" % float(meal["rating"])).replace(".", ","), meal["rating_amt"])
+
+
+def _canvas():
     from PIL import Image, ImageDraw
-    PW, PH = gui.PW, gui.PH
-    top = gui.TAB_Y1 + 1                                    # 16: the first row below the name tab
-    left, right = gui.VIS_X0 + 2, gui.VIS_X1 - 1            # 25 .. 251
-    col = header_colour(meal)
-    rows = gui.blank()
+    img = Image.new("P", (gui.PW, gui.PH), 0)
+    d = ImageDraw.Draw(img)
+    d.fontmode = "1"                                        # no anti-aliasing: every pixel is a palette index
+    return img, d
 
-    # header: x > 80 is free in rows 0-15 (the name tab only covers the left part)
-    head = Image.new("L", (PW, top), 0)
-    hd = ImageDraw.Draw(head)
-    hfont = _font(11, bold=True)
-    hd.text((gui.TAB_X1 + 4, 1), ausgabe(meal), fill=255, font=hfont)
+
+def _rows(img):
+    px = img.load()
+    return [[px[x, y] & 15 for x in range(gui.PW)] for y in range(gui.PH)]
+
+
+def _chip(d, x, y, text, bg, fg, font, min_w=0, h=11):
+    """A filled, rounded label. Returns the x just right of it."""
+    w = max(min_w, int(d.textlength(text, font=font)) + 7)
+    d.rounded_rectangle((x, y, x + w - 1, y + h - 1), 2, fill=bg)
+    d.text((x + (w - d.textlength(text, font=font)) / 2, y + (h - font.size) // 2 - 1), text, fill=fg, font=font)
+    return x + w
+
+
+def _fit(d, text, font, width):
+    if d.textlength(text, font=font) <= width:
+        return text
+    while len(text) > 1 and d.textlength(text + "…", font=font) > width:
+        text = text[:-1]
+    return text.rstrip(" ,.-&") + "…"
+
+
+def overview_pictures(date, meals):
+    """The whole menu in a few pictures: PER_PAGE dishes each, one line per dish (counter label in the counter's
+    colour, diet badge, name, price). The header next to the name tab carries the day and the page number; on the
+    last page it also credits the source."""
+    pages = [meals[i:i + PER_PAGE] for i in range(0, len(meals), PER_PAGE)]
+    out = []
+    left, right, top = gui.VIS_X0 + 2, gui.VIS_X1 - 1, gui.TAB_Y1 + 1
+    chip_font, font, bold = _font(9, True), _font(10), _font(10, True)
+    for n, page in enumerate(pages):
+        img, d = _canvas()
+        last = n == len(pages) - 1
+        title = "Quelle: mensa-kl.de" if last and len(pages) > 1 else "Mensa KL · %s" % day_title(date)
+        if last and len(pages) == 1:
+            title = "%s · mensa-kl.de" % day_title(date)
+        d.text((gui.TAB_X1 + 4, 1), title, fill=1, font=_font(11, True))
+        pg = "%d/%d" % (n + 1, len(pages))
+        d.text((right - d.textlength(pg, font=bold), 2), pg, fill=1, font=bold)
+        d.line((gui.TAB_X1 + 1, top - 1, gui.VIS_X1, top - 1), fill=2)
+        y = top + 2
+        for meal in page:
+            x = _chip(d, left, y, COUNTER_SHORT.get(ausgabe(meal), ausgabe(meal)[:5]), counter_colour(meal), 0,
+                      chip_font, min_w=32) + 2
+            badge = DIET_BADGE.get(diet(meal))
+            if badge:
+                x = _chip(d, x, y, badge[1], badge[2], badge[3], chip_font, min_w=15) + 2
+            price = price_text(meal).replace(" €", "")     # the overview is tight: prices without the sign
+            pw = int(d.textlength(price, font=bold))
+            d.text((right - pw, y), price, fill=1, font=bold)
+            d.text((x + 1, y), _fit(d, title_text(meal), font, right - pw - 5 - x), fill=1, font=font)
+            y += 15
+        out.append(gui.clip(_rows(img)))
+    return out
+
+
+def meal_picture(meal, photo=None, colour=True):
+    """One 80 x 256 PictoChat picture for a meal: header (counter label left, price right), the photo on the left,
+    the name on the right, and a line of badges (diet, rating) at the bottom. Without a photo the text uses the
+    full width."""
+    left, right, top = gui.VIS_X0 + 2, gui.VIS_X1 - 1, gui.TAB_Y1 + 1
+    col = counter_colour(meal)
+    img, d = _canvas()
+    _chip(d, gui.TAB_X1 + 4, 1, ausgabe(meal), col, 0, _font(10, True), h=13)
     price = price_text(meal)
-    if price:
-        hd.text((right - hd.textlength(price, font=hfont), 1), price, fill=255, font=hfont)
-    hp = head.load()
-    for y in range(top):
-        for x in range(PW):
-            if hp[x, y] > 110:
-                rows[y][x] = col
-    for x in range(gui.VIS_X0, gui.VIS_X1 + 1):             # thin rule under the header
-        rows[top - 1][x] = 2 if x > gui.TAB_X1 else 0
+    hfont = _font(11, True)
+    d.text((right - d.textlength(price, font=hfont), 1), price, fill=1, font=hfont)
+    d.line((gui.TAB_X1 + 1, top - 1, gui.VIS_X1, top - 1), fill=2)
 
-    # body
-    photo_w = 0
-    if photo:
-        photo_w = 84
-        _photo_rows(rows, photo, (left, top + 1, photo_w, PH - top - 1), colour)
+    photo_w = 84 if photo else 0
     tx = left + (photo_w + 5 if photo else 3)
-    tw = right - tx
-    body = Image.new("L", (PW, PH), 0)
-    bd = ImageDraw.Draw(body)
-    font = _font(11)
-    meta = meta_text(meal)
-    line_h = 12
-    avail = (PH - top - 3) // line_h                        # 5 lines
-    lines = _wrap(bd, title_text(meal), font, tw, avail - (1 if meta else 0))
+    font, line_h = _font(11), 12
+    badge, stars = DIET_BADGE.get(diet(meal)), rating_text(meal)
+    has_meta = bool(badge or stars)
+    avail = (gui.PH - top - 3) // line_h                    # 5 lines
     y = top + 3
-    for ln in lines:
-        bd.text((tx, y), ln, fill=255, font=font)
+    for ln in _wrap(d, title_text(meal), font, right - tx, avail - (1 if has_meta else 0)):
+        d.text((tx, y), ln, fill=1, font=font)
         y += line_h
-    bp = body.load()
-    for yy in range(top, PH):
-        for xx in range(PW):
-            if bp[xx, yy] > 110:
-                rows[yy][xx] = 1
-    if meta:
-        meta_img = Image.new("L", (PW, PH), 0)
-        ImageDraw.Draw(meta_img).text((tx, PH - line_h - 1), meta, fill=255, font=_font(10, bold=True))
-        mp = meta_img.load()
-        for yy in range(PH - line_h - 1, PH):
-            for xx in range(tx, right + 1):
-                if mp[xx, yy] > 110:
-                    rows[yy][xx] = col
+    x, by = tx, gui.PH - 12
+    if badge:
+        x = _chip(d, x, by, badge[0], badge[2], badge[3], _font(9, True)) + 4
+    if stars:
+        d.text((x, by), stars, fill=6, font=_font(10, True))
+    rows = _rows(img)
+    if photo:
+        _photo_rows(rows, photo, (left, top + 1, photo_w, gui.PH - top - 1), colour)
     return gui.clip(rows)
 
 
@@ -302,19 +370,54 @@ def day_title(date):
     return "%s %d.%d." % (WEEKDAYS[d.weekday()], d.day, d.month)
 
 
-def send_menu(arg, send_text, send_picture, colour=False):
-    """Handle '/mensa [arg]': a title, one picture per meal, then the source line. Returns a short status string
-    (also on errors: they do not raise, so the bot keeps running)."""
+COUNTER_WORDS = {"1": "Ausgabe 1", "2": "Ausgabe 2", "a1": "Ausgabe 1", "a2": "Ausgabe 2", "atrium": "Atrium",
+                 "atr": "Atrium", "grill": "Grill", "abend": "Abend", "alle": "*", "all": "*", "fotos": "*",
+                 "photos": "*"}
+
+
+def split_arg(arg):
+    """'/mensa' argument -> (counter filter or None, the rest for parse_arg). '1', 'atrium', 'grill' ... choose the
+    photo cards of one counter, 'alle' the cards of every dish; 'ausgabe 1' works too."""
+    words = [w for w in arg.strip().lower().split() if w != "ausgabe"]
+    counter = None
+    rest = []
+    for i, w in enumerate(words):
+        nxt = words[i + 1] if i + 1 < len(words) else ""
+        if counter is None and w in COUNTER_WORDS and nxt not in ("tage", "tag", "days", "day"):
+            counter = COUNTER_WORDS[w]
+        else:
+            rest.append(w)
+    return counter, " ".join(rest)
+
+
+def send_menu(arg, send_text, send_picture, colour=True):
+    """Handle '/mensa [counter] [day]'. Without a counter: the overview, a few pictures with one line per dish.
+    With a counter ('1', '2', 'atrium', 'grill', 'abend') or 'alle': one photo card per dish. Returns a short status
+    string (also on errors: they do not raise, so the bot keeps running)."""
     try:
-        date_arg = parse_arg(arg)
-        date, meals = fetch_meals(date_arg)
+        counter, rest = split_arg(arg)
+        date, meals = fetch_meals(parse_arg(rest))
     except MensaError as e:
         return "mensa: %s" % e
     if not meals:
         return "mensa: no meals found for %s" % (arg.strip() or "today")
-    send_text("[comic big blue] Mensa KL, %s" % day_title(date))
+    counters = []
+    for m in meals:
+        if ausgabe(m) not in counters:
+            counters.append(ausgabe(m))
+    hint = ", ".join("/mensa %s" % (c[-1] if c.startswith("Ausgabe ") else c.lower()) for c in counters)
+    if counter is None:
+        pages = overview_pictures(date, meals)
+        for rows in pages:
+            send_picture(rows)
+        return ("mensa: the overview of %d dishes for %s is already in the room (%d pictures, source credited). Do "
+                "not repeat the dishes. Say in one short line that photo cards per counter come with: %s (or "
+                "/mensa alle)." % (len(meals), day_title(date), len(pages), hint))
+    chosen = meals if counter == "*" else [m for m in meals if ausgabe(m) == counter]
+    if not chosen:
+        return "mensa: no dishes at %s on %s; counters that day: %s" % (counter, day_title(date), hint)
     with_photo = failed = 0
-    for meal in meals:
+    for meal in chosen:
         try:
             photo = photo_bytes(meal)
         except MensaError:
@@ -326,10 +429,11 @@ def send_menu(arg, send_text, send_picture, colour=False):
             photo = None
         with_photo += 1 if photo else 0
         send_picture(rows)
-    send_text("[mono small] Quelle: mensa-kl.de")
-    return ("mensa: sent %d meals for %s (%d with photo%s). The pictures are already in the room - do not "
+    send_text("[mono small] %s · Quelle: mensa-kl.de" % day_title(date))
+    return ("mensa: sent %d photo cards (%s, %s; %d with photo%s). The pictures are already in the room - do not "
             "repeat the dishes, just confirm in a few words." % (
-                len(meals), date, with_photo, ", %d photo downloads failed" % failed if failed else ""))
+                len(chosen), "all counters" if counter == "*" else counter, day_title(date), with_photo,
+                ", %d photo downloads failed" % failed if failed else ""))
 
 
 # ---------------------------------------------------------------- preview
@@ -348,13 +452,16 @@ if __name__ == "__main__":
         out = sys.argv[2]
         os.makedirs(out, exist_ok=True)
         arg = sys.argv[3] if len(sys.argv) > 3 else ""
-        colour = "--colour" in sys.argv
-        date, meals = fetch_meals(parse_arg(arg.replace("--colour", "")))
+        counter, rest = split_arg(arg)
+        date, meals = fetch_meals(parse_arg(rest))
         print(date, len(meals), "meals")
+        for i, rows in enumerate(overview_pictures(date, meals)):
+            _png(rows, os.path.join(out, "overview_%d.png" % (i + 1)))
         for m in meals:
+            if counter not in (None, "*") and ausgabe(m) != counter:
+                continue
             p = photo_bytes(m)
-            path = os.path.join(out, "%s_%s%s.png" % (m["m_id"], "colour_" if colour else "", "photo" if p else "nophoto"))
-            _png(meal_picture(m, p, colour), path)
-            print(path, "|", ausgabe(m), price_text(m), "|", meta_text(m), "|", title_text(m)[:60])
+            _png(meal_picture(m, p), os.path.join(out, "card_%s_%s.png" % (ausgabe(m).replace(" ", ""), m["m_id"])))
+            print(ausgabe(m), price_text(m), "|", diet(m), rating_text(m), "|", title_text(m)[:60])
     else:
         print(__doc__)
