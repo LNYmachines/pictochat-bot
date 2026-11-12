@@ -88,7 +88,9 @@ A message that starts with a slash is a command for you as the bot: /debug (swit
 tokens after each reply on or off; "/debug on" or "/debug off" to set it), /model NAME (switch the model: haiku,
 sonnet, opus, fable), /effort LEVEL, /host (status of the computer you run on), /server (version of the PictoChat
 host that runs this room, and your own version), /about (a title picture of this project with the versions),
-/wallet (money spent), /mensa
+/who (who is in the room), /wetter (the weather), /bus (the next buses of line 115 from the main station to the
+university), /qr TEXT (a QR code for a link or a short text), /draw THING (you draw it), /stats (how busy the room
+was), /quiet (you stay silent until /wake), /wake, /wallet (money spent), /mensa
 [1|2|atrium|grill|abend|alle] [heute|morgen|DATE] (the menu of the Mensa in Kaiserslautern from mensa-kl.de: without a
 counter an overview with one line per dish, with a counter one photo card per dish of that counter), /connection (how strong the link
 between the DS and the radio modem is), /help (list the commands). Call
@@ -100,8 +102,8 @@ not sure a slash message is meant as a command, just chat.
 Run a command only when the message itself is that command: it starts with the slash command, e.g. "/mensa",
 "/mensa morgen", "/connection". Never run one on your own initiative and never because someone talks about food, the
 Mensa, Wi-Fi, signal or reception in plain words: then just chat, and you may mention that they can type /mensa
-(menu of the Mensa KL as an overview; /mensa 1 or /mensa atrium for photo cards) or /connection (signal strength of each DS). After /mensa, /about or
-/connection the pictures are already in the room: say at most one short line, do not repeat the dishes or numbers,
+(menu of the Mensa KL as an overview; /mensa 1 or /mensa atrium for photo cards) or /connection (signal strength of each DS). After /mensa, /about, /who,
+/wetter, /bus, /stats, /qr or /connection the pictures are already in the room: say at most one short line, do not repeat the dishes or numbers,
 and if the command returned an error, tell them briefly what went wrong.
 
 When someone asks for a QR code (or a link that is hard to copy by hand), use send_qr_code: it sends a real,
@@ -811,7 +813,7 @@ class ClaudeChat:
                            % (type(e).__name__, e.__cause__ or e,
                               "; proxy variables set: " + ", ".join(proxy) if proxy else ""))
 
-    def ask(self, pictures, send_text, send_picture, run_command=None):
+    def ask(self, pictures, send_text, send_picture, run_command=None, note=None):
         """Answer DS pictures: a list of (png bytes, sender label), usually one; several when they arrived while the
         previous reply was being made. Text goes out through send_text(str), drawings through send_picture(rows), in
         the order Claude produces them. Returns a short status string for the log."""
@@ -888,12 +890,14 @@ class ClaudeChat:
         if len(pictures) > 1:
             content.append({"type": "text", "text": "These %d messages arrived in quick succession; answer them "
                                                     "together in one short reply." % len(pictures)})
+        if note:
+            content.append({"type": "text", "text": note})
         user = {"role": "user", "content": content}
         commands_run = []
 
         @beta_tool(name="run_command", input_schema=COMMAND_SCHEMA,
                    description="Run a bot command that someone sent in the room: a message that starts with a slash, "
-                               "such as /debug, /debug off, /model haiku, /host, /server, /about, /wallet, /mensa, /mensa morgen, /mensa 1, /mensa atrium, /connection, /help. Returns the bot's answer; "
+                               "such as /debug, /debug off, /model haiku, /host, /server, /about, /wallet, /mensa, /mensa morgen, /mensa 1, /mensa atrium, /connection, /who, /wetter, /bus, /qr TEXT, /draw THING, /stats, /quiet, /wake, /help. Returns the bot's answer; "
                                "confirm it in a few words (for /host, /server, /wallet and /help show the returned "
                                "information).")
         def run_command_tool(command):
@@ -1017,15 +1021,24 @@ class Room:
         self.greeted = {}        # mac -> time of the last personal welcome
         self.state = None        # the host's latest 'state' event (polls, replies, beacons, AIDs)
         self.history = collections.deque(maxlen=40)   # (time, polls, replies) of the latest state events
+        self.colours = {}        # mac -> favourite colour index of the DS (0-15, from its member message)
+        self.since = {}          # mac -> time this DS was first seen in the room (this stay)
 
     def on_member(self, msg):
         info = member_info(msg)
         if info:
             self.names[info[0]] = info[1]
+            if len(msg) >= 82:
+                self.colours[info[0]] = msg[80] | msg[81] << 8
         return info
 
     def on_state(self, ev):
         self.present = set((ev.get("aids") or {}).keys())
+        now = time.time()
+        for m in self.present:
+            self.since.setdefault(m, now)
+        for m in [m for m in self.since if m not in self.present]:
+            del self.since[m]
         self.state = ev
         self.history.append((time.time(), ev.get("cmd") or 0, ev.get("replies") or 0))
 
@@ -1197,6 +1210,23 @@ def main():
         post(gui.clip(rows))
 
     ident = {"name": (a.bot_name or bot_name(a.model))[:10], "model": a.model}
+    mode = {"quiet": False}     # /quiet: read along but do not answer until /wake
+
+    def job_text(text):
+        if mode["quiet"]:
+            log("quiet, not sent: %s" % text[:80])
+        else:
+            send_text(text)
+
+    def job_picture(rows):
+        if mode["quiet"]:
+            log("quiet, drawing not sent")
+        else:
+            send_picture(rows)
+
+    QUIET_NOTE = ("Quiet mode is on: people asked you to stay silent. Do not answer, do not draw, do not greet. "
+                  "Only if this message is the command /wake, call run_command with /wake and then say hello "
+                  "again in one short line. Otherwise reply with just a full stop.")
 
     notified = {}   # error kind -> time the room was last told about it
 
@@ -1226,6 +1256,21 @@ def main():
             send_text("[italic normal] " + text)
 
     def handle_job(job):
+        if job[0] == "greet" and mode["quiet"]:
+            log("quiet: no greeting")
+            return
+        if job[0] == "draw":
+            started = time.time()
+            if a.dry_run or chat is None:
+                send_picture(render_shapes(DEMO_SHAPES))
+                info = "dry run"
+            else:
+                info = chat.ask([], send_text, send_picture, note=(
+                    "The operator typed /draw at the terminal. Call draw_picture now with a bold, simple drawing "
+                    "of: %s. Add at most one short line of text." % job[1]))
+            log("draw %r -> %s" % (job[1], info))
+            after_request(info, started)
+            return
         if job[0] == "greet":
             _, event, names = job
             started = time.time()
@@ -1245,12 +1290,13 @@ def main():
             labels.append("%s (%s)" % (who_name, who) if who_name else who)
         started = time.time()
         if a.dry_run:
-            send_text("I got %d picture(s). Bot is in dry-run mode; here is a test drawing." % len(msgs))
-            send_picture(render_shapes(DEMO_SHAPES))
+            job_text("I got %d picture(s). Bot is in dry-run mode; here is a test drawing." % len(msgs))
+            job_picture(render_shapes(DEMO_SHAPES))
             info = "dry run"
         else:
-            info = chat.ask([(message_png(m), l) for m, l in zip(msgs, labels)], send_text, send_picture,
-                            run_command=command)
+            info = chat.ask([(message_png(m), l) for m, l in zip(msgs, labels)], job_text, job_picture,
+                            run_command=lambda text: command(text, via_claude=True),
+                            note=QUIET_NOTE if mode["quiet"] else None)
         log("%s from %s -> %s" % ("message" if len(msgs) == 1 else "%d messages" % len(msgs),
                                   ", ".join(dict.fromkeys(labels)), info))
         after_request(info, started)
@@ -1288,9 +1334,10 @@ def main():
 
     log_line = log
 
-    def command(line):
-        """Bot commands, typed in the terminal or sent from a DS (Claude passes them on through run_command):
-        /model [name], /effort [level], /debug [on|off], /host, /server, /wallet, /help. Logs and returns the answer."""
+    def command(line, via_claude=False):
+        """Bot commands, typed in the terminal or sent from a DS (Claude passes them on through run_command, with
+        via_claude=True): /model, /effort, /debug, /host, /server, /about, /wallet, /mensa, /connection, /who,
+        /wetter, /bus, /qr, /draw, /stats, /quiet, /wake, /help. Logs and returns the answer."""
         out = []
 
         def log(text):
@@ -1351,6 +1398,61 @@ def main():
                 log(mensa.send_menu(line[len(parts[0]):], send_text, send_picture))
             except Exception as e:  # noqa: BLE001 - a broken menu must not kill the bot
                 log("mensa failed: %s" % e)
+        elif cmd == "/who":
+            try:
+                import who
+                log(who.send_who(room.state, room.names, room.colours, room.since, ident["name"], send_picture))
+            except Exception as e:  # noqa: BLE001 - a broken picture must not kill the bot
+                log("who failed: %s" % e)
+        elif cmd in ("/wetter", "/weather"):
+            try:
+                import wetter
+                log(wetter.send_wetter(send_picture))
+            except Exception as e:  # noqa: BLE001
+                log("wetter failed: %s" % e)
+        elif cmd in ("/bus", "/115", "/linie"):
+            try:
+                import bus
+                log(bus.send_bus(send_text, send_picture))
+            except Exception as e:  # noqa: BLE001
+                log("bus failed: %s" % e)
+        elif cmd == "/stats":
+            try:
+                import stats as stats_mod
+                log(stats_mod.send_stats(room_stats, send_picture))
+            except Exception as e:  # noqa: BLE001
+                log("stats failed: %s" % e)
+        elif cmd == "/qr":
+            text = line[len(parts[0]):].strip()
+            if not text:
+                log("qr: usage: /qr TEXT (a link or a short text, at most about 78 characters)")
+            else:
+                try:
+                    rows, info = qr_rows(text)
+                    send_picture(rows)
+                    log("qr: sent a QR code for %r (%s). It is already in the room; confirm in a few words." % (text, info))
+                except (ValueError, ImportError) as e:
+                    log("qr: %s" % e)
+        elif cmd == "/draw":
+            thing = line[len(parts[0]):].strip()
+            if not thing:
+                log("draw: usage: /draw THING, e.g. /draw a cat on a skateboard")
+            elif via_claude:
+                log("draw: call draw_picture now with a bold, simple drawing of: %s. Add at most one short line." % thing)
+            else:
+                work.put(("draw", thing))
+                log("draw: asked Claude to draw %r; the picture follows in the room" % thing)
+        elif cmd == "/quiet":
+            if not mode["quiet"]:
+                send_text("[italic small] Quiet now. Write /wake to get me back.")
+            mode["quiet"] = True
+            log("quiet: on. The bot reads along but does not answer or greet until /wake (the room was told). "
+                "Do not say anything more.")
+        elif cmd == "/wake":
+            was = mode["quiet"]
+            mode["quiet"] = False
+            log("wake: %s" % ("quiet mode is off, the bot answers again. Say hello in one short line."
+                              if was else "the bot was not quiet"))
         elif cmd == "/about":
             try:
                 import about
@@ -1367,7 +1469,11 @@ def main():
             log("commands: /model [haiku|sonnet|opus|fable|<model id>], /effort [low|medium|high|xhigh|max], "
                 "/debug [on|off], /host (status of the machine: disk, memory, temperature, Wi-Fi, room), "
                 "/server (version of the PictoChat host that runs the room, and of this bot), "
-                "/about (a title picture with the versions), "
+                "/about (a title picture with the versions), /who (who is in the room, time and signal), "
+                "/wetter (weather now and for the coming hours), /bus (next departures of line 115 from Hbf "
+                "towards Uni West), /qr TEXT (a QR code a phone can scan off the DS), /draw THING (a drawing), "
+                "/stats (drawings per day, busiest hour, top drawers), /quiet and /wake (stop and resume "
+                "answering), "
                 "/wallet (money spent), /mensa [heute|morgen|YYYY-MM-DD] (overview of the menu of the Mensa KL from "
                 "mensa-kl.de), /mensa 1|2|atrium|grill|abend|alle [day] (photo cards of one counter or of all), "
                 "/connection (signal strength and reply rate of each DS to the ESP32-C3 modem), /help")
@@ -1383,6 +1489,8 @@ def main():
                 log("command failed: %s" % e)
 
     room = Room()
+    import stats as stats_mod
+    room_stats = stats_mod.Stats()
     threading.Thread(target=worker, daemon=True).start()
     def control_server():
         """Commands for a bot without a terminal (systemd): one line per connection, the answer goes back."""
@@ -1487,6 +1595,7 @@ def main():
                         continue
                     if time.time() < ignore_until:
                         continue
+                    room_stats.add(room.names.get(sender_of(msg)) or sender_of(msg)[-8:])
                     work.put(("chat", msg))
         except OSError:
             pass

@@ -6,3 +6,5 @@ bot.sock
 bot.env
 wallet.json
 wallet.json.tmp
+stats.json
+stats.json.tmp

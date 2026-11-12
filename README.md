@@ -77,6 +77,20 @@ sudo python3 ../pictochat_host/pictochat.py host --iface <wifi-interface> --chan
 - **`/server`** (alias `/version`): the version and git commit of the PictoChat host that runs the room, whether it
   is the Python or the Rust host, its radio, how long it has been running, and this bot's own version. It needs a
   host of version 0.2.0 or newer.
+- **`/who`** (`who.py`): who is in the room, one line per DS: its favourite colour, nickname, time in the room and
+  signal bars.
+- **`/wetter`** (`wetter.py`): the weather now and for the coming hours as one picture with drawn icons. Data from
+  open-meteo.com (no key). The place is Kaiserslautern; change it with `WETTER_LAT`, `WETTER_LON`, `WETTER_NAME`.
+- **`/bus`** (`bus.py`, aliases `/115`, `/linie`): the next four departures of bus line 115 from Kaiserslautern Hbf
+  towards Uni West, with minutes to go, delay (when the service has live data) and platform. Data from the VRN
+  departure monitor (vrn.de). Other stops and lines: `BUS_STOP`, `BUS_STOP_NAME`, `BUS_LINE`, `BUS_DIRECTION`,
+  `BUS_TO`.
+- **`/qr TEXT`**: a QR code for a link or a short text (about 78 characters at most) that a phone can scan off the DS.
+- **`/draw THING`**: Claude draws it.
+- **`/stats`** (`stats.py`): drawings per day for the last week, the busiest hour and the top three drawers. The
+  bot counts in `stats.json` from the first run with this version on; there is no earlier history.
+- **`/quiet`** and **`/wake`**: the bot stops answering and greeting until `/wake`. It still reads each message to
+  notice `/wake`, so quiet mode still costs one small API request per message.
 - **`/about`** (`about.py`): a title picture drawn in the DS's 16 colours (a handheld, radio waves, the versions of
   host and bot). `python3 about.py preview OUTDIR` renders it without sending.
 - **`/mensa [day]`** (`mensa.py`): the menu of the Mensa Kaiserslautern from the mensa-kl.de JSON API as an
@@ -147,6 +161,8 @@ image code), and the piwheels Pillow needs `libopenjp2-7` and friends. `botctl` 
 | `mensa.py` | `/mensa`: Mensa Kaiserslautern menu as pictures (`python3 mensa.py preview OUTDIR` renders without sending) |
 | `connection.py` | `/connection`: signal and reply rate per DS as pictures |
 | `about.py` | `/about`: title picture with the versions |
+| `who.py`, `wetter.py`, `bus.py`, `stats.py` | the picture commands of the same names |
+| `pics.py` | shared drawing helpers for the picture commands |
 | `screenshots/` | the bot on an emulated DS |
 
 ## License
