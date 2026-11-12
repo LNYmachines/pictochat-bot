@@ -1,0 +1,4 @@
+anthropic    # Claude API
+pillow       # pictures
+segno        # QR codes
+# tkinter: system package python3-tk (pictochat_gui.py imports it)

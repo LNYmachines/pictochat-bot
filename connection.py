@@ -12,7 +12,15 @@ import time
 import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location("pictochat_gui", os.path.join(HERE, "pictochat_gui.py"))
+def _find_host_file(name):
+    """pictochat_gui.py comes from the PictoChat host repo: next to this file, in $PICTOCHAT_HOST, or ../pictochat_host."""
+    for d in (HERE, os.environ.get("PICTOCHAT_HOST", ""), os.path.join(HERE, "..", "pictochat_host")):
+        if d and os.path.isfile(os.path.join(d, name)):
+            return os.path.join(d, name)
+    sys.exit(f"{name} not found: put the PictoChat host repo next to this one (../pictochat_host) or set PICTOCHAT_HOST")
+
+
+_spec = importlib.util.spec_from_file_location("pictochat_gui", _find_host_file("pictochat_gui.py"))
 gui = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gui)
 

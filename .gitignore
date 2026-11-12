@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+bot.sock
+bot.env
+wallet.json
+wallet.json.tmp
